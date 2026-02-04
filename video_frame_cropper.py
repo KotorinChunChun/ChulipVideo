@@ -1,53 +1,72 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
-import tkinter.ttk as ttk
-from PIL import Image, ImageTk
-import cv2
-import time
-import io
-import ctypes
-import ctypes.wintypes
-import os
+from __future__ import annotations
+
 import json
-import sys
-import subprocess
+import os
+import re
+import time
+import tkinter as tk
+import tkinter.ttk as ttk
+from tkinter import filedialog, messagebox, simpledialog
+from typing import TYPE_CHECKING, Any, Callable
+
+import cv2
+import screen_recorder
+from PIL import Image, ImageTk
+
+# 分割したモジュールからインポート
+from utils import (
+    get_base_dir,
+    sec_to_hhmmss,
+    sec_to_display,
+    hhmmss_to_sec,
+    imwrite_jp,
+    ratio_value_from_str,
+    ratio_label_from_wh,
+)
+from config import (
+    CONFIG_FILENAME,
+    load_global_config,
+    save_global_config,
+    load_video_settings,
+    save_video_settings as save_video_settings_to_file,
+    normalize_presets,
+    get_default_presets_with_labels,
+)
+from clipboard import copy_image_to_clipboard
+from seekbar import SeekbarMixin
+from crop_handler import CropHandlerMixin
+from export import ExportMixin
 
 
-def get_base_dir():
-    """実行ファイルまたはスクリプトのベースディレクトリを返す。
-    PyInstallerでバンドルした場合は実行ファイルの場所に、通常実行時はスクリプトの場所にする。
-    """
-    try:
-        if getattr(sys, 'frozen', False):
-            return os.path.dirname(sys.executable)
-    except Exception:
-        pass
-    return os.path.dirname(os.path.abspath(__file__))
+class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
+    """動画のクロップと出力を行うGUIアプリケーション."""
 
+    # キャンバスサイズ
+    CANVAS_W: int = 640
+    CANVAS_H: int = 360
+    CANVAS_MIN_H: int = 60  # 映像表示領域の最小高さ
 
-# 設定ファイル名を定数化
-CONFIG_FILENAME = "video_frame_cropper_config.json"
-
-
-class VideoCropperApp:
-    CANVAS_W = 640
-    CANVAS_H = 360
-    CANVAS_MIN_H = 100
-    MIN_W = 20
-    MIN_H = 20
+    # クロップ矩形の最小サイズ
+    MIN_W: int = 20
+    MIN_H: int = 20
 
     # シークバー設定
-    SEEK_H = 100
-    SEEK_MARGIN = 20
+    SEEK_H: int = 100
+    SEEK_MARGIN: int = 20
+
+    # 矩形リサイズハンドルのサイズとエッジ判定マージン
+    HANDLE_SIZE: int = 8
+    EDGE_MARGIN: int = 20
 
     def __init__(self, root):
         self.root = root
-        self.root.title("動画クリップ取得ツール - Created By ことりちゅん")
+        self.root.title("動画クリップ取得ツール - Created By ことりちゅん - v0.2")
 
         # ウィンドウサイズと最小サイズの初期値（縦は小さくしてキャンバスを縮められるように）
-        self.root.minsize(860, 420)
+        # 起動時にUI全体が見えるよう最小高さを少し小さくする
+        self.root.minsize(800, 360)
 
-        # Video / playback state
+        # ビデオ / 再生状態
         self.cap = None
         self.frame = None
         self.fps = 30.0
@@ -59,11 +78,11 @@ class VideoCropperApp:
         self.video_filename = ""  # 動画ファイル名（拡張子除く）
         self.video_filepath = ""  # 動画ファイルのフルパス
 
-        # Trim times
+        # トリム時間
         self.start_time = 0
         self.end_time = 0
 
-        # Crop rectangle
+        # クロップ矩形
         self.crop_rect = [100, 80, 300, 250]
         self.dragging_rect = False
         self.resizing_rect = False
@@ -72,6 +91,8 @@ class VideoCropperApp:
         self.orig_rect = None
         self.maintain_aspect_ratio = False  # Shift キー押下時のアスペクト比ロック
         self.orig_aspect_ratio = 1.0  # 元のアスペクト比
+        # 矩形のフォーカス状態（左クリックでオレンジにする）
+        self.rect_focused = False
 
         # Seekbar dragging state
         self.drag_mode = None  # "current", "start", "end"
@@ -103,6 +124,9 @@ class VideoCropperApp:
         self._panning = False
         self._pan_start = (0, 0)
 
+        self.lock_var = tk.BooleanVar(value=False)
+        self.lock_move_var = tk.BooleanVar(value=False)
+
         # ツールチップ用のストレージ
         self._tooltips = {}
 
@@ -131,6 +155,17 @@ class VideoCropperApp:
         self.root.bind_all('<KeyRelease-Left>', lambda e: self._on_arrow_release(e))
         self.root.bind_all('<KeyPress-Right>', lambda e: self._on_arrow_press(e, 1))
         self.root.bind_all('<KeyRelease-Right>', lambda e: self._on_arrow_release(e))
+        # Alt+矢印でクロップ矩形を1px移動
+        # return "break" to stop further handling (avoid double-handling)
+        self.root.bind_all('<Alt-Up>', lambda e: (self.move_crop_by(0, -1) or "break"))
+        self.root.bind_all('<Alt-Down>', lambda e: (self.move_crop_by(0, 1) or "break"))
+        self.root.bind_all('<Alt-Left>', lambda e: (self.move_crop_by(-1, 0) or "break"))
+        self.root.bind_all('<Alt-Right>', lambda e: (self.move_crop_by(1, 0) or "break"))
+        # Shift+矢印でクロップ矩形を拡大縮小（上下で高さ、左右で幅を2pxずつ）
+        self.root.bind_all('<Shift-Up>', lambda e: (self.expand_crop(0, 1) or "break"))
+        self.root.bind_all('<Shift-Down>', lambda e: (self.expand_crop(0, -1) or "break"))
+        self.root.bind_all('<Shift-Left>', lambda e: (self.expand_crop(-1, 0) or "break"))
+        self.root.bind_all('<Shift-Right>', lambda e: (self.expand_crop(1, 0) or "break"))
         # Home/End bindings
         self.root.bind_all('<Home>', lambda e: self.set_current_time_direct(self.start_time))
         self.root.bind_all('<End>', lambda e: self.set_current_time_direct(self.end_time))
@@ -149,6 +184,10 @@ class VideoCropperApp:
         top_panel = tk.Frame(self.root)
         top_panel.pack(fill=tk.X, side=tk.TOP, padx=5, pady=3)
 
+        # 録画ツール起動ボタン (赤系)
+        tk.Button(top_panel, text="録画ツール", command=self.open_screen_recorder,
+                  bg="#ffcccc", width=10).pack(side=tk.LEFT, padx=5)
+
         tk.Button(top_panel, text="動画を開く", command=self.load_video,
                   width=10).pack(side=tk.LEFT, padx=5)
 
@@ -163,10 +202,7 @@ class VideoCropperApp:
         # 右上のヘルプボタン（ショートカット一覧）
         self.btn_help = tk.Button(top_panel, text="?", command=self.show_shortcuts, width=3)
         self.btn_help.pack(side=tk.RIGHT, padx=4)
-        try:
-            self.add_tooltip(self.btn_help, "ショートカット一覧を表示")
-        except Exception:
-            pass
+        self.add_tooltip(self.btn_help, "ショートカット一覧を表示")
 
         # 1. Video Canvas (拡大縮小対応)
         self.canvas = tk.Canvas(
@@ -189,6 +225,7 @@ class VideoCropperApp:
         self.canvas.bind("<ButtonPress-2>", self.on_middle_down)
         self.canvas.bind("<B2-Motion>", self.on_middle_drag)
         self.canvas.bind("<ButtonRelease-2>", self.on_middle_up)
+        self.canvas.bind("<Double-Button-2>", self.on_middle_double_click)
         # マウスホイールでズーム（Windows と X11 両対応）
         self.canvas.bind("<MouseWheel>", self.on_canvas_wheel)
         self.canvas.bind("<Button-4>", self.on_canvas_wheel)
@@ -204,37 +241,22 @@ class VideoCropperApp:
 
         self.btn_video_start = tk.Button(main_ctrl, text="◀◀先頭", command=self.go_to_video_start, width=8)
         self.btn_video_start.pack(side=tk.LEFT, padx=4)
-        try:
-            self.add_tooltip(self.btn_video_start, "Ctrl+Home: 動画先頭へ")
-        except Exception:
-            pass
+        self.add_tooltip(self.btn_video_start, "Ctrl+Home: 動画先頭へ")
         self.btn_trim_start = tk.Button(main_ctrl, text="◀開始位置", command=self.go_to_trim_start, width=10)
         self.btn_trim_start.pack(side=tk.LEFT, padx=4)
-        try:
-            self.add_tooltip(self.btn_trim_start, "Home: 開始位置へ")
-        except Exception:
-            pass
+        self.add_tooltip(self.btn_trim_start, "Home: 開始位置へ")
 
         self.btn_play = tk.Button(main_ctrl, text="▲再生", command=self.toggle_play, width=12)
         # 区間再生はチェックボックス化（末尾ボタンの右）
         self.btn_play.pack(side=tk.LEFT, padx=4)
-        try:
-            self.add_tooltip(self.btn_play, "Space: 再生/停止")
-        except Exception:
-            pass
+        self.add_tooltip(self.btn_play, "Space: 再生/停止")
 
         btn_end = tk.Button(main_ctrl, text="終了位置▶", command=self.go_to_trim_end, width=10)
         btn_end.pack(side=tk.LEFT, padx=4)
-        try:
-            self.add_tooltip(btn_end, "End: 終了位置へ")
-        except Exception:
-            pass
+        self.add_tooltip(btn_end, "End: 終了位置へ")
         btn_tail = tk.Button(main_ctrl, text="末尾▶▶", command=self.go_to_video_end, width=8)
         btn_tail.pack(side=tk.LEFT, padx=4)
-        try:
-            self.add_tooltip(btn_tail, "Ctrl+End: 動画末尾へ")
-        except Exception:
-            pass
+        self.add_tooltip(btn_tail, "Ctrl+End: 動画末尾へ")
         self.range_var = tk.BooleanVar(value=False)
         tk.Checkbutton(main_ctrl, text="区間再生", variable=self.range_var).pack(side=tk.LEFT, padx=(4,8))
 
@@ -245,27 +267,16 @@ class VideoCropperApp:
         self.pingpong_var = tk.BooleanVar(value=False)
         self.chk_pingpong = tk.Checkbutton(main_ctrl, text="往復再生", variable=self.pingpong_var, state=tk.DISABLED)
         self.chk_pingpong.pack(side=tk.LEFT, padx=(4,8))
-        try:
-            self.add_tooltip(self.chk_pingpong, "ループ時のみ有効: 端で再生方向を反転")
-        except Exception:
-            pass
+        self.add_tooltip(self.chk_pingpong, "ループ時のみ有効: 端で再生方向を反転")
+
         # ループ状態に応じて往復チェックの有効/無効を切替
-        try:
-            def _on_loop_change(*args):
-                try:
-                    if self.loop_var.get():
-                        self.chk_pingpong.config(state=tk.NORMAL)
-                    else:
-                        self.chk_pingpong.config(state=tk.DISABLED)
-                        self.pingpong_var.set(False)
-                except Exception:
-                    pass
-            self.loop_var.trace_add('write', _on_loop_change)
-        except Exception:
-            try:
-                self.loop_var.trace('w', lambda *a: _on_loop_change())
-            except Exception:
-                pass
+        def _on_loop_change(*args):
+            if self.loop_var.get():
+                self.chk_pingpong.config(state=tk.NORMAL)
+            else:
+                self.chk_pingpong.config(state=tk.DISABLED)
+                self.pingpong_var.set(False)
+        self.loop_var.trace_add('write', _on_loop_change)
 
         # Speed input with Spinbox
         tk.Label(main_ctrl, text="速度:").pack(side=tk.LEFT, padx=(10, 2))
@@ -280,18 +291,12 @@ class VideoCropperApp:
             command=self.change_speed
         )
         self.speed_spinbox.pack(side=tk.LEFT, padx=5)
-        try:
-            self.add_tooltip(self.speed_spinbox, "速度: -9.9〜9.9 (変更後Enter)")
-        except Exception:
-            pass
+        self.add_tooltip(self.speed_spinbox, "速度: -9.9〜9.9 (変更後Enter)")
 
         # prevent space key from inserting into these controls (Space should toggle play)
         def _ignore_space(e):
             return "break"
-        try:
-            self.speed_spinbox.bind('<space>', _ignore_space)
-        except Exception:
-            pass
+        self.speed_spinbox.bind('<space>', _ignore_space)
 
         # Enterキーを押したときに更新
         self.speed_spinbox.bind("<Return>", self.change_speed)
@@ -332,11 +337,7 @@ class VideoCropperApp:
             btn_minus = tk.Button(ctrl_f, text="-1s", width=4,
                       command=lambda: self.adjust_time(var_getter, var_setter, -1))
             btn_minus.pack(side=tk.LEFT)
-            try:
-                # 1秒戻す（ツールチップ）
-                self.add_tooltip(btn_minus, "-1s: 1秒戻す")
-            except Exception:
-                pass
+            self.add_tooltip(btn_minus, "-1s: 1秒戻す")
 
             entry = tk.Entry(ctrl_f, width=14, font=(
                 "Consolas", 12), justify="center")
@@ -350,11 +351,7 @@ class VideoCropperApp:
             btn_plus = tk.Button(ctrl_f, text="+1s", width=4,
                       command=lambda: self.adjust_time(var_getter, var_setter, 1))
             btn_plus.pack(side=tk.LEFT)
-            try:
-                # 1秒進める（ツールチップ）
-                self.add_tooltip(btn_plus, "+1s: 1秒進める")
-            except Exception:
-                pass
+            self.add_tooltip(btn_plus, "+1s: 1秒進める")
 
             return entry
 
@@ -376,18 +373,9 @@ class VideoCropperApp:
                              lambda: self.end_time, self.set_end_time_direct, True)
 
         # disable space input for time entry boxes
-        try:
-            self.entry_start.bind('<space>', _ignore_space)
-        except Exception:
-            pass
-        try:
-            self.entry_current.bind('<space>', _ignore_space)
-        except Exception:
-            pass
-        try:
-            self.entry_end.bind('<space>', _ignore_space)
-        except Exception:
-            pass
+        self.entry_start.bind('<space>', _ignore_space)
+        self.entry_current.bind('<space>', _ignore_space)
+        self.entry_end.bind('<space>', _ignore_space)
 
 
         # 2.7. Crop Size Input Panel (placed below trimming range per user request)
@@ -402,21 +390,22 @@ class VideoCropperApp:
         self.btn_undo = tk.Button(size_ctrl, text="戻す", command=self.undo_crop, width=6)
         self.btn_undo.pack(side=tk.LEFT, padx=4)
         self.btn_undo.config(state=tk.DISABLED)
-        try:
-            self.add_tooltip(self.btn_undo, "Ctrl+Z: 戻す")
-        except Exception:
-            pass
+        self.add_tooltip(self.btn_undo, "Ctrl+Z: 戻す")
         # 進むボタン（Redo）
         self.btn_redo = tk.Button(size_ctrl, text="進む", command=self.redo_crop, width=6)
         self.btn_redo.pack(side=tk.LEFT, padx=4)
         self.btn_redo.config(state=tk.DISABLED)
-        try:
-            self.add_tooltip(self.btn_redo, "Ctrl+Y: 進む")
-        except Exception:
-            pass
+        self.add_tooltip(self.btn_redo, "Ctrl+Y: 進む")
+
+        # 座標パネルラベルとロックボタン
+        ttk.Separator(size_ctrl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        tk.Label(size_ctrl, text="座標:").pack(side=tk.LEFT, padx=(5,0))
+        self.btn_lock_move = tk.Button(size_ctrl, text="🔓", width=3, font=("Consolas", 14, "bold"), bg="#ccffcc", command=self.toggle_move_lock)
+        self.btn_lock_move.pack(side=tk.LEFT, padx=(2,5))
+        self.add_tooltip(self.btn_lock_move, "クロップ位置(X, Y)をロック (リサイズは可能)")
 
         # X座標入力
-        tk.Label(size_ctrl, text="左上座標 X:").pack(side=tk.LEFT, padx=5)
+        tk.Label(size_ctrl, text="X:").pack(side=tk.LEFT, padx=2)
         self.entry_crop_x = tk.Entry(
             size_ctrl, width=8, font=("Consolas", 10), justify="center")
         self.entry_crop_x.insert(0, "100")
@@ -425,6 +414,7 @@ class VideoCropperApp:
             "<Return>", lambda e: self.update_crop_from_entries())
         self.entry_crop_x.bind(
             "<FocusOut>", lambda e: self.update_crop_from_entries())
+        self.add_tooltip(self.entry_crop_x, "クロップ開始X座標 (Alt+左右で1px移動, Shift+左右で幅を拡大縮小)")
 
         # Y座標入力
         tk.Label(size_ctrl, text="Y:").pack(side=tk.LEFT, padx=5)
@@ -436,9 +426,16 @@ class VideoCropperApp:
             "<Return>", lambda e: self.update_crop_from_entries())
         self.entry_crop_y.bind(
             "<FocusOut>", lambda e: self.update_crop_from_entries())
+        self.add_tooltip(self.entry_crop_y, "クロップ開始Y座標 (Alt+上下で1px移動, Shift+上下で高さを拡大縮小)")
 
-        # 幅と高さ選択（プリセットは設定ファイルに保持）。右に比率選択を追加
-        tk.Label(size_ctrl, text="  解像度:").pack(side=tk.LEFT, padx=5)
+        # 幅と高さ選択
+        ttk.Separator(size_ctrl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        tk.Label(size_ctrl, text="解像度:").pack(side=tk.LEFT, padx=5)
+        # 解像度ロックボタン
+        self.btn_lock_res = tk.Button(size_ctrl, text="🔓", width=3, font=("Consolas", 14, "bold"), bg="#ccffcc", command=self.toggle_resolution_lock)
+        self.btn_lock_res.pack(side=tk.LEFT, padx=(2,5))
+        self.add_tooltip(self.btn_lock_res, "解像度・アスペクト比をロック (移動は可能)")
+
         # 比率選択
         self.ratio_var = tk.StringVar(value=self.aspect_options[0])
         self.ratio_optionmenu = tk.OptionMenu(size_ctrl, self.ratio_var, *self.aspect_options)
@@ -447,14 +444,7 @@ class VideoCropperApp:
         self.resolution_var = tk.StringVar(value="カスタム")
         self.resolution_optionmenu = tk.OptionMenu(size_ctrl, self.resolution_var, "カスタム")
         self.resolution_optionmenu.pack(side=tk.LEFT, padx=2)
-        # 比率が変わったら解像度の選択肢を絞り込む
-        try:
-            self.ratio_var.trace_add('write', lambda *args: self.update_resolution_menu())
-        except Exception:
-            try:
-                self.ratio_var.trace('w', lambda *args: self.update_resolution_menu())
-            except Exception:
-                pass
+        self.ratio_var.trace_add('write', lambda *args: self.update_resolution_menu())
 
         # 幅入力
         tk.Label(size_ctrl, text="幅:").pack(side=tk.LEFT, padx=5)
@@ -466,6 +456,7 @@ class VideoCropperApp:
             "<Return>", lambda e: self.update_crop_from_entries())
         self.entry_crop_w.bind(
             "<FocusOut>", lambda e: self.update_crop_from_entries())
+        self.add_tooltip(self.entry_crop_w, "出力される画像の幅 (ピクセル)")
 
         # 高さ入力
         tk.Label(size_ctrl, text="高:").pack(side=tk.LEFT, padx=5)
@@ -477,10 +468,13 @@ class VideoCropperApp:
             "<Return>", lambda e: self.update_crop_from_entries())
         self.entry_crop_h.bind(
             "<FocusOut>", lambda e: self.update_crop_from_entries())
+        self.add_tooltip(self.entry_crop_h, "出力される画像の高さ (ピクセル)")
 
         # プリセット保存/削除ボタン
-        tk.Button(size_ctrl, text="プリセット保存", command=self.add_resolution_preset).pack(side=tk.LEFT, padx=4)
-        tk.Button(size_ctrl, text="プリセット削除", command=self.delete_resolution_preset).pack(side=tk.LEFT, padx=4)
+        self.btn_save_preset = tk.Button(size_ctrl, text="プリセット保存", command=self.add_resolution_preset)
+        self.btn_save_preset.pack(side=tk.LEFT, padx=4)
+        self.btn_delete_preset = tk.Button(size_ctrl, text="プリセット削除", command=self.delete_resolution_preset)
+        self.btn_delete_preset.pack(side=tk.LEFT, padx=4)
 
         
 
@@ -508,10 +502,7 @@ class VideoCropperApp:
         tk.Button(left_out, text="設定確認", command=self.open_video_settings).pack(side=tk.LEFT, padx=6, pady=4)
         self.btn_reload_settings = tk.Button(left_out, text="設定再読み込み", command=self.load_config)
         self.btn_reload_settings.pack(side=tk.LEFT, padx=6, pady=4)
-        try:
-            self.add_tooltip(self.btn_reload_settings, "設定ファイルを再読み込み")
-        except Exception:
-            pass
+        self.add_tooltip(self.btn_reload_settings, "設定ファイルを再読み込み")
 
         # 右側: 出力操作（右下にまとめる）
         right_out = tk.Frame(output_panel)
@@ -539,16 +530,10 @@ class VideoCropperApp:
         png_btn_frame.pack(side=tk.TOP, anchor=tk.E, pady=2)
         self.btn_copy_image = tk.Button(png_btn_frame, text="🖼️コピー", width=12, command=self.copy_crop_to_clipboard)
         self.btn_copy_image.pack(side=tk.LEFT, padx=(0,6))
-        try:
-            self.add_tooltip(self.btn_copy_image, "Ctrl+C: 現在のクロップをコピー")
-        except Exception:
-            pass
+        self.add_tooltip(self.btn_copy_image, "Ctrl+C: 現在のクロップをコピー")
         self.btn_export_png = tk.Button(png_btn_frame, text="PNG出力", width=12, command=self.export_png, bg="#ffdddd")
         self.btn_export_png.pack(side=tk.LEFT)
-        try:
-            self.add_tooltip(self.btn_export_png, "PNG出力（フォルダ選択）")
-        except Exception:
-            pass
+        self.add_tooltip(self.btn_export_png, "PNG出力（フォルダ選択）")
 
         tk.Button(right_out, text="動画保存", width=24, command=self.export_video, bg="#ddffdd").pack(side=tk.TOP, anchor=tk.E, pady=2)
 
@@ -559,7 +544,8 @@ class VideoCropperApp:
     def load_window_geometry(self):
         """設定ファイルからウィンドウの位置とサイズを読み込む"""
         config_path = os.path.join(get_base_dir(), CONFIG_FILENAME)
-        default_geometry = "860x665"
+        # デフォルト起動ジオメトリ（UIがウィンドウ内に収まるよう縦を抑える）
+        default_geometry = "860x600"
 
         if os.path.exists(config_path):
             try:
@@ -664,21 +650,11 @@ class VideoCropperApp:
                             ]
 
                         self.current_time = self.start_time
-                        # UIを更新
-                        # apply scaled coords when possible
+                        # UIを更新 - スケールされた座標で矩形とハンドルを更新
                         try:
-                            self.canvas.coords(self.rect_id, *self._scaled_rect_from_crop())
-                            # update corner handles
                             scaled = self._scaled_rect_from_crop()
-                            cx1, cy1, cx2, cy2 = scaled
-                            size = 8
-                            corners = [
-                                (cx1 - size//2, cy1 - size//2, cx1 + size//2, cy1 + size//2),
-                                (cx2 - size//2, cy1 - size//2, cx2 + size//2, cy1 + size//2),
-                                (cx1 - size//2, cy2 - size//2, cx1 + size//2, cy2 + size//2),
-                                (cx2 - size//2, cy2 - size//2, cx2 + size//2, cy2 + size//2),
-                            ]
-                            self._update_corner_handles(corners)
+                            self.canvas.coords(self.rect_id, *scaled)
+                            self._update_corner_handles(self._get_corner_coords(scaled))
                         except Exception:
                             self.canvas.coords(self.rect_id, *self.crop_rect)
                         # フルパス表示と秒数表示を更新
@@ -693,6 +669,10 @@ class VideoCropperApp:
                         self.show_frame_at(self.current_time)
                         self.update_ui_texts()
                         self.update_crop_entries()
+                        try:
+                            self.draw_seekbar()
+                        except Exception:
+                            pass
 
                 # 解像度プリセットがあれば読み込む、なければデフォルトを作成して保存
                 presets = config.get("resolution_presets")
@@ -944,64 +924,28 @@ class VideoCropperApp:
                 self.save_config()
         
 
-    # ------------------ ヘルパー: 画像入出力 ------------------
+    # ------------------ ヘルパー: 画像入出力 (utils モジュールに委譲) ------------------
     def imwrite_jp(self, filename, img, params=None):
-        """日本語パス対応の画像保存関数"""
-        try:
-            ext = os.path.splitext(filename)[1]
-            result, n = cv2.imencode(ext, img, params)
+        """日本語パス対応の画像保存関数（utils.imwrite_jp に委譲）"""
+        return imwrite_jp(filename, img, params)
 
-            if result:
-                with open(filename, mode='w+b') as f:
-                    n.tofile(f)
-                return True
-            return False
-        except Exception as e:
-            print(f"Save Error: {e}")
-            return False
-
-    # ------------------ ヘルパー: 時間変換 ------------------
+    # ------------------ ヘルパー: 時間変換 (utils モジュールに委譲) ------------------
     def sec_to_hhmmss(self, sec):
-        sec = int(sec)
-        h = sec // 3600
-        m = (sec % 3600) // 60
-        s = sec % 60
-        return f"{h:02d}{m:02d}{s:02d}"
+        return sec_to_hhmmss(sec)
 
     def sec_to_display(self, sec):
         """表示用: HH:MM:SS.mmm (ミリ秒まで)"""
-        try:
-            sec_f = float(sec)
-        except Exception:
-            sec_f = 0.0
-        h = int(sec_f) // 3600
-        m = (int(sec_f) % 3600) // 60
-        s_int = int(sec_f % 60)
-        ms = int((sec_f - int(sec_f)) * 1000)
-        return f"{h:02d}:{m:02d}:{s_int:02d}.{ms:03d}"
+        return sec_to_display(sec)
 
     def hhmmss_to_sec(self, time_str):
-        try:
-            # 対応する書式: HH:MM:SS.sss, MM:SS.sss, SS.sss, または単純な秒数（小数可）
-            if ":" in time_str:
-                parts = time_str.split(":")
-                parts = [p.strip() for p in parts if p.strip() != ""]
-                if len(parts) == 3:
-                    h = int(parts[0])
-                    m = int(parts[1])
-                    s = float(parts[2])
-                    return h*3600 + m*60 + s
-                elif len(parts) == 2:
-                    m = int(parts[0])
-                    s = float(parts[1])
-                    return m*60 + s
-                elif len(parts) == 1:
-                    return float(parts[0])
-            else:
-                return float(time_str)
-        except Exception as e:
-            messagebox.showerror("Err", f"時間指定が不正です: {e}")
-        return 0.0
+        result = hhmmss_to_sec(time_str)
+        if result == 0.0 and time_str.strip() not in ("0", "0.0", "00:00:00", ""):
+            # パースに失敗した場合のみエラーを表示
+            try:
+                float(time_str)
+            except ValueError:
+                messagebox.showerror("Err", f"時間指定が不正です: {time_str}")
+        return result
 
     # ------------------ ロジック: 時間調整 ------------------
     def adjust_time(self, getter, setter, delta):
@@ -1031,7 +975,8 @@ class VideoCropperApp:
         self.update_ui_texts()
         try:
             # UIの更新を強制してから次の操作（再生）を受け付けやすくする
-            self.root.update_idletasks()
+            # self.root.update_idletasks()
+            pass
         except Exception:
             pass
 
@@ -1045,7 +990,8 @@ class VideoCropperApp:
         self.update_ui_texts()
         try:
             # UIの更新を強制してから次の操作（再生）を受け付けやすくする
-            self.root.update_idletasks()
+            # self.root.update_idletasks()
+            pass
         except Exception:
             pass
 
@@ -1056,7 +1002,8 @@ class VideoCropperApp:
         self.update_ui_texts()
         try:
             # UI の状態を即座に反映しておく
-            self.root.update_idletasks()
+            # self.root.update_idletasks()
+            pass
         except Exception:
             pass
 
@@ -1101,56 +1048,29 @@ class VideoCropperApp:
         self.update_undo_button_state()
 
     def undo_crop(self, event=None):
-        # 最後に積んだ状態を取り出して適用（無限回数）
+        """Undo最後のクロップ矩形変更を元に戻す."""
         if not self.crop_history:
             return
         # 現在状態を redo に退避
-        try:
-            cur = [int(v) for v in self.crop_rect]
-            self.crop_redo.append(cur)
-        except Exception:
-            pass
+        cur = [int(v) for v in self.crop_rect]
+        self.crop_redo.append(cur)
         last = self.crop_history.pop()
         self.crop_rect = last
         # 矩形をキャンバスに反映し、角ハンドルも更新
-        scaled = self._scaled_rect_from_crop()
-        self.canvas.coords(self.rect_id, *scaled)
-        cx1, cy1, cx2, cy2 = scaled
-        size = 8
-        corners = [
-            (cx1 - size//2, cy1 - size//2, cx1 + size//2, cy1 + size//2),
-            (cx2 - size//2, cy1 - size//2, cx2 + size//2, cy1 + size//2),
-            (cx1 - size//2, cy2 - size//2, cx1 + size//2, cy2 + size//2),
-            (cx2 - size//2, cy2 - size//2, cx2 + size//2, cy2 + size//2),
-        ]
-        self._update_corner_handles(corners)
-        self.update_crop_entries()
+        self._sync_crop_rect_ui()
         self.update_undo_button_state()
 
-    def redo_crop(self):
+    def redo_crop(self) -> None:
+        """Redo最後のクロップ矩形変更をやり直す."""
         if not getattr(self, 'crop_redo', None):
             return
-        try:
-            # 現在状態を undo 履歴に保存
-            cur = [int(v) for v in self.crop_rect]
-            self.crop_history.append(cur)
-        except Exception:
-            pass
+        # 現在状態を undo 履歴に保存
+        cur = [int(v) for v in self.crop_rect]
+        self.crop_history.append(cur)
         nxt = self.crop_redo.pop()
         self.crop_rect = nxt
         # 矩形をキャンバスに反映し、角ハンドルも更新
-        scaled = self._scaled_rect_from_crop()
-        self.canvas.coords(self.rect_id, *scaled)
-        cx1, cy1, cx2, cy2 = scaled
-        size = 8
-        corners = [
-            (cx1 - size//2, cy1 - size//2, cx1 + size//2, cy1 + size//2),
-            (cx2 - size//2, cy1 - size//2, cx2 + size//2, cy1 + size//2),
-            (cx1 - size//2, cy2 - size//2, cx1 + size//2, cy2 + size//2),
-            (cx2 - size//2, cy2 - size//2, cx2 + size//2, cy2 + size//2),
-        ]
-        self._update_corner_handles(corners)
-        self.update_crop_entries()
+        self._sync_crop_rect_ui()
         self.update_undo_button_state()
 
     def update_undo_button_state(self):
@@ -1232,37 +1152,12 @@ class VideoCropperApp:
         except Exception:
             pass
 
-    # ------------------ 比率ヘルパー ------------------
+    # ------------------ 比率ヘルパー (utils モジュールに委譲) ------------------
     def _ratio_value_from_str(self, rstr):
-        try:
-            if isinstance(rstr, str) and ':' in rstr:
-                a, b = rstr.split(':')
-                return float(a) / float(b)
-        except Exception:
-            pass
-        return None
+        return ratio_value_from_str(rstr)
 
     def _ratio_label_from_wh(self, w, h):
-        try:
-            r = float(w) / float(h)
-        except Exception:
-            return '?:?'
-        can = [('16:9', 16.0/9.0), ('9:16', 9.0/16.0), ('4:3', 4.0/3.0), ('3:4', 3.0/4.0), ('21:9', 21.0/9.0), ('1:1', 1.0), ('4:5', 4.0/5.0), ('5:4', 5.0/4.0)]
-        best = None
-        best_diff = 1.0
-        for label, val in can:
-            diff = abs(r - val)
-            if diff < best_diff:
-                best_diff = diff
-                best = label
-        if best is not None and best_diff <= 0.03:
-            return best
-        try:
-            from math import gcd
-            g = gcd(int(w), int(h))
-            return f"{int(w//g)}:{int(h//g)}"
-        except Exception:
-            return f"{w}:{h}"
+        return ratio_label_from_wh(w, h)
 
     def update_crop_from_entries(self):
         """クロップサイズ入力フィールドから矩形を更新"""
@@ -1285,59 +1180,10 @@ class VideoCropperApp:
         except ValueError:
             pass
 
-    # ------------------ クリップボード / ショートカット一覧 UI ------------------
+    # ------------------ クリップボード (clipboard モジュールに委譲) ------------------
     def _copy_image_to_clipboard(self, pil_img):
-        # First try pywin32 if available (more reliable)
-        try:
-            import win32clipboard
-            import win32con
-            output = io.BytesIO()
-            pil_img.convert('RGB').save(output, 'BMP')
-            data = output.getvalue()[14:]
-            output.close()
-            win32clipboard.OpenClipboard()
-            try:
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardData(win32con.CF_DIB, data)
-            finally:
-                win32clipboard.CloseClipboard()
-            return True
-        except Exception:
-            pass
-
-        # Fallback to ctypes on Windows to set CF_DIB data (BMP without BITMAPFILEHEADER)
-        try:
-            output = io.BytesIO()
-            pil_img.convert('RGB').save(output, 'BMP')
-            data = output.getvalue()[14:]
-            output.close()
-
-            GMEM_MOVEABLE = 0x0002
-            CF_DIB = 8
-            kernel32 = ctypes.windll.kernel32
-            user32 = ctypes.windll.user32
-
-            if not user32.OpenClipboard(0):
-                raise RuntimeError('OpenClipboard failed')
-            try:
-                user32.EmptyClipboard()
-                hGlobal = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-                if not hGlobal:
-                    raise RuntimeError('GlobalAlloc failed')
-                pGlobal = kernel32.GlobalLock(hGlobal)
-                if not pGlobal:
-                    kernel32.GlobalFree(hGlobal)
-                    raise RuntimeError('GlobalLock failed')
-                # ensure destination pointer type
-                ctypes.memmove(ctypes.c_void_p(pGlobal), data, len(data))
-                kernel32.GlobalUnlock(hGlobal)
-                user32.SetClipboardData(CF_DIB, hGlobal)
-            finally:
-                user32.CloseClipboard()
-            return True
-        except Exception as e:
-            print(f"Clipboard copy failed: {e}")
-            return False
+        """PIL画像をクリップボードにコピーする（clipboard.copy_image_to_clipboard に委譲）"""
+        return copy_image_to_clipboard(pil_img)
 
     # ------------------ 矢印キーのリピート処理 ------------------
     def _on_arrow_press(self, event, direction):
@@ -1381,6 +1227,17 @@ class VideoCropperApp:
         except Exception:
             ctrl = False
         step = 1.0 if ctrl else 0.1
+        # detect alt for crop movement when rectangle is focused
+        try:
+            # Alt is often 0x20000 on Windows or 0x8 on some systems
+            alt_held = (event.state & (0x20000 | 0x8)) != 0
+        except Exception:
+            alt_held = False
+        if alt_held and getattr(self, 'rect_focused', False) and self._arrow_dir in (-1, 1):
+            # move crop horizontally by 1px per step (no fractional)
+            dx = -1 if self._arrow_dir == -1 else 1
+            self.move_crop_by(dx, 0)
+            return
         if self._arrow_dir == -1:
             self.set_current_time_direct(max(0, self.current_time - step))
         elif self._arrow_dir == 1:
@@ -1432,9 +1289,14 @@ class VideoCropperApp:
         except Exception:
             pass
 
-        # スクリプトディレクトリからショートカット一覧を読み込む（存在しなければフォールバック）
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(script_dir, 'README_shortcuts.md')
+        # EXE化時のリソースパス解決用ヘルパー
+        def resource_path(relative_path):
+            if hasattr(sys, '_MEIPASS'):
+                return os.path.join(sys._MEIPASS, relative_path)
+            return os.path.join(os.path.abspath("."), relative_path)
+
+        # リソースパスからショートカット一覧を読み込む
+        path = resource_path('README_shortcuts.md')
         text = ''
         if os.path.exists(path):
             try:
@@ -1482,8 +1344,82 @@ class VideoCropperApp:
             self.entry_crop_h.delete(0, tk.END)
             self.entry_crop_h.insert(0, str(int(h)))
 
+    def toggle_resolution_lock(self):
+        """解像度設定とマウスによるリサイズをロック/解除する"""
+        is_locked = not self.lock_var.get()
+        self.lock_var.set(is_locked)
+        self.btn_lock_res.config(text="🔒" if is_locked else "🔓", bg="#ffcccc" if is_locked else "#ccffcc")
+        
+        state = tk.DISABLED if is_locked else tk.NORMAL
+        self.ratio_optionmenu.config(state=state)
+        self.resolution_optionmenu.config(state=state)
+        self.entry_crop_w.config(state=state)
+        self.entry_crop_h.config(state=state)
+        self.btn_undo.config(state=state if self.crop_history else tk.DISABLED)
+        self.btn_redo.config(state=state if self.crop_redo else tk.DISABLED)
+        self.btn_save_preset.config(state=state)
+        self.btn_delete_preset.config(state=state)
+
+    def toggle_move_lock(self):
+        """座標設定とマウスによる移動をロック/解除する"""
+        is_locked = not self.lock_move_var.get()
+        self.lock_move_var.set(is_locked)
+        self.btn_lock_move.config(text="🔒" if is_locked else "🔓", bg="#ffcccc" if is_locked else "#ccffcc")
+        
+        state = tk.DISABLED if is_locked else tk.NORMAL
+        self.entry_crop_x.config(state=state)
+        self.entry_crop_y.config(state=state)
+
+    def move_crop_by(self, dx, dy):
+        """クロップ矩形をdx,dyだけ移動（ピクセル単位）。Alt+矢印用。"""
+        if self.lock_move_var.get():
+            return
+        try:
+            # undo 履歴に現在の矩形を登録
+            try:
+                self.push_crop_history()
+            except Exception:
+                pass
+            x1, y1, x2, y2 = self.crop_rect
+            nx1 = x1 + dx
+            ny1 = y1 + dy
+            nx2 = x2 + dx
+            ny2 = y2 + dy
+            self.crop_rect = self.clamp_rect_canvas([nx1, ny1, nx2, ny2])
+            self._sync_crop_rect_ui()
+        except Exception:
+            pass
+
+    def expand_crop(self, dx, dy):
+        """クロップ矩形を中心を維持して拡大・縮小（ピクセル単位）。Shift+矢印用。
+        dx=1: 幅+2, dx=-1: 幅-2
+        dy=1: 高+2, dy=-1: 高-2
+        """
+        if self.lock_var.get():
+            return
+        try:
+            self.push_crop_history()
+            x1, y1, x2, y2 = self.crop_rect
+            nx1 = x1 - dx
+            ny1 = y1 - dy
+            nx2 = x2 + dx
+            ny2 = y2 + dy
+
+            # 最小サイズチェック
+            if (nx2 - nx1) < self.MIN_W:
+                nx1, nx2 = x1, x2
+            if (ny2 - ny1) < self.MIN_H:
+                ny1, ny2 = y1, y2
+
+            self.crop_rect = self.clamp_rect_canvas([nx1, ny1, nx2, ny2])
+            self._sync_crop_rect_ui()
+        except Exception:
+            pass
+
     def apply_resolution_preset(self, preset_name):
         """プリセット解像度を適用（self.resolution_presets を参照）"""
+        if self.lock_var.get():
+            return
         presets = self.resolution_presets or {}
         if preset_name in presets:
             pair = presets[preset_name]
@@ -1503,6 +1439,35 @@ class VideoCropperApp:
             self.entry_crop_h.delete(0, tk.END)
             self.entry_crop_h.insert(0, str(h))
             self.update_crop_from_entries()
+
+    def update_crop_from_entries(self):
+        # ロック状態の取得
+        size_locked = self.lock_var.get()
+        move_locked = self.lock_move_var.get()
+        
+        if size_locked and move_locked:
+            return
+            
+        try:
+            cur_x, cur_y, cur_x2, cur_y2 = self.crop_rect
+            cur_w = cur_x2 - cur_x
+            cur_h = cur_y2 - cur_y
+            
+            # 入力値を取得
+            new_x = int(self.entry_crop_x.get()) if not move_locked else cur_x
+            new_y = int(self.entry_crop_y.get()) if not move_locked else cur_y
+            new_w = int(self.entry_crop_w.get()) if not size_locked else cur_w
+            new_h = int(self.entry_crop_h.get()) if not size_locked else cur_h
+            
+            if (new_x == cur_x and new_y == cur_y and 
+                new_w == cur_w and new_h == cur_h):
+                return
+
+            self.push_crop_history()
+            self.crop_rect = self.clamp_rect_resize(new_x, new_y, new_x + new_w, new_y + new_h)
+            self._sync_crop_rect_ui()
+        except Exception:
+            pass
 
     # ------------------ 動画再生ロジック ------------------
     def change_speed(self, event=None):
@@ -1568,9 +1533,37 @@ class VideoCropperApp:
         except Exception:
             pass
 
-    def load_video(self):
-        path = filedialog.askopenfilename(filetypes=[(
-            "MP4", "*.mp4"), ("MKV", "*.mkv"), ("MOV", "*.mov"), ("All files", "*.*")])
+    def open_screen_recorder(self):
+        """スクリーンレコーダーを起動"""
+        app = screen_recorder.ScreenRecorderApp(self.root, parent_app=self)
+
+    def open_video_file(self, result_path):
+        """外部から指定された動画ファイルを開く"""
+        if not os.path.exists(result_path):
+            return
+        self.load_video(target_path=result_path)
+
+    def load_video(self, target_path=None):
+        """Load video file.
+        
+        Args:
+            target_path: 指定がある場合はそのパスを開く。Noneの場合はダイアログを表示。
+        """
+        if self.playing:
+            self.toggle_play()
+
+        if target_path:
+            path = target_path
+        else:
+            path = filedialog.askopenfilename(filetypes=[
+                ("動画ファイル", ("*.mp4", "*.mkv", "*.mov", "*.avi")),
+                ("MP4", "*.mp4"),
+                ("MKV", "*.mkv"),
+                ("MOV", "*.mov"),
+                ("AVI", "*.avi"),
+                ("すべてのファイル", "*.*")
+            ])
+        
         if not path:
             return
 
@@ -1661,17 +1654,9 @@ class VideoCropperApp:
                 cy = (self.CANVAS_H - ch) // 2
                 self.crop_rect = self.clamp_rect_canvas([cx, cy, cx+cw, cy+ch])
         try:
-            self.canvas.coords(self.rect_id, *self._scaled_rect_from_crop())
             scaled = self._scaled_rect_from_crop()
-            cx1, cy1, cx2, cy2 = scaled
-            size = 8
-            corners = [
-                (cx1 - size//2, cy1 - size//2, cx1 + size//2, cy1 + size//2),
-                (cx2 - size//2, cy1 - size//2, cx2 + size//2, cy1 + size//2),
-                (cx1 - size//2, cy2 - size//2, cx1 + size//2, cy2 + size//2),
-                (cx2 - size//2, cy2 - size//2, cx2 + size//2, cy2 + size//2),
-            ]
-            self._update_corner_handles(corners)
+            self.canvas.coords(self.rect_id, *scaled)
+            self._update_corner_handles(self._get_corner_coords(scaled))
         except Exception:
             self.canvas.coords(self.rect_id, *self.crop_rect)
 
@@ -1687,6 +1672,10 @@ class VideoCropperApp:
         self.show_frame_at(0)
         self.update_ui_texts()
         self.update_crop_entries()
+        try:
+            self.draw_seekbar()
+        except Exception:
+            pass
 
         # Clear undo/redo memory when switching video
         try:
@@ -1719,7 +1708,8 @@ class VideoCropperApp:
                     self.set_current_time_direct(self.start_time)
             try:
                 # ensure UI state is flushed before starting playback
-                self.root.update_idletasks()
+                # self.root.update_idletasks()
+                pass
             except Exception:
                 pass
             # If current position is at an unplayable end, restart from beginning
@@ -1916,16 +1906,20 @@ class VideoCropperApp:
         ]
         self.canvas.coords(self.rect_id, *scaled_rect)
 
+        # ズーム/スケールに合わせて矩形枠線幅を調整（動画解像度における2ドット分の太さを再現）
+        try:
+            # 動画ピクセルからキャンバス表示ピクセルへのトータルスケールを計算
+            total_scale_x = rw / frame_w if frame_w > 0 else 1.0
+            total_scale_y = rh / frame_h if frame_h > 0 else 1.0
+            avg_total_scale = (total_scale_x + total_scale_y) / 2.0
+            # 元の動画の2ドット分を表示上の太さにする（最低1ドットは維持）
+            line_w = max(1, int(round(2 * avg_total_scale)))
+            self.canvas.itemconfig(self.rect_id, width=line_w)
+        except Exception:
+            pass
+
         # 角マーカー（ハンドル）を描画/更新する
-        cx1, cy1, cx2, cy2 = scaled_rect
-        size = 8
-        corners = [
-            (cx1 - size//2, cy1 - size//2, cx1 + size//2, cy1 + size//2),
-            (cx2 - size//2, cy1 - size//2, cx2 + size//2, cy1 + size//2),
-            (cx1 - size//2, cy2 - size//2, cx1 + size//2, cy2 + size//2),
-            (cx2 - size//2, cy2 - size//2, cx2 + size//2, cy2 + size//2),
-        ]
-        self._update_corner_handles(corners)
+        self._update_corner_handles(self._get_corner_coords(scaled_rect))
 
     # ------------------ キャンバスリサイズ処理 ------------------
     def on_canvas_resize(self, event):
@@ -1942,18 +1936,34 @@ class VideoCropperApp:
             # シークバーを再描画
             self.update_ui_texts()
 
-    def _update_corner_handles(self, corners):
-        # corners: list of (x1,y1,x2,y2)
+    def _update_corner_handles(self, corners: list[tuple[int, int, int, int]]) -> None:
+        """コーナーハンドルの矩形を更新（存在しなければ作成）."""
         if not hasattr(self, 'corner_ids'):
             self.corner_ids = [None, None, None, None]
         for i, rect in enumerate(corners):
-            try:
-                if self.corner_ids[i] is None:
-                    self.corner_ids[i] = self.canvas.create_rectangle(*rect, fill='red')
-                else:
-                    self.canvas.coords(self.corner_ids[i], *rect)
-            except Exception:
-                pass
+            if self.corner_ids[i] is None:
+                self.corner_ids[i] = self.canvas.create_rectangle(*rect, fill='red')
+            else:
+                self.canvas.coords(self.corner_ids[i], *rect)
+
+    def _get_corner_coords(self, scaled_rect: list[int]) -> list[tuple[int, int, int, int]]:
+        """スケール後の矩形座標から4隅のハンドル矩形座標を計算."""
+        cx1, cy1, cx2, cy2 = scaled_rect
+        size = self.HANDLE_SIZE
+        half = size // 2
+        return [
+            (cx1 - half, cy1 - half, cx1 + half, cy1 + half),
+            (cx2 - half, cy1 - half, cx2 + half, cy1 + half),
+            (cx1 - half, cy2 - half, cx1 + half, cy2 + half),
+            (cx2 - half, cy2 - half, cx2 + half, cy2 + half),
+        ]
+
+    def _sync_crop_rect_ui(self) -> None:
+        """クロップ矩形をキャンバスに反映し、ハンドルとエントリを更新."""
+        scaled_rect = self._scaled_rect_from_crop()
+        self.canvas.coords(self.rect_id, *scaled_rect)
+        self._update_corner_handles(self._get_corner_coords(scaled_rect))
+        self.update_crop_entries()
 
     # ------------------ シークバーとマーカー ------------------
     def get_x(self, t):
@@ -2046,9 +2056,10 @@ class VideoCropperApp:
         self.drag_mode = None
 
     def handle_seek_drag(self, mouse_x):
-        # Mouse dragging is coarse, but we round to int for 1-sec snapping
-        # Note: For long videos, this might jump >1 sec.
-        t = int(round(self.get_t(mouse_x)))
+        # 1秒単位の丸めから、フレーム単位（FPSに基づく）の丸めに変更
+        t_raw = self.get_t(mouse_x)
+        fps = getattr(self, 'fps', 30.0) or 30.0
+        t = round(t_raw * fps) / fps
 
         if self.drag_mode == "current":
             self.set_current_time_direct(t)
@@ -2057,150 +2068,61 @@ class VideoCropperApp:
         elif self.drag_mode == "end":
             self.set_end_time_direct(t)
 
-    # ------------------ クロップ矩形のマウス操作イベント ------------------
-    def clamp_rect_canvas(self, r):
-        x1, y1, x2, y2 = r
-        x1, x2 = sorted([x1, x2])
-        y1, y2 = sorted([y1, y2])
-        w = max(self.MIN_W, x2-x1)
-        h = max(self.MIN_H, y2-y1)
-        if x1 < 0:
-            x1 = 0
-        if y1 < 0:
-            y1 = 0
-        if x1+w > self.CANVAS_W:
-            x1 = self.CANVAS_W-w
-        if y1+h > self.CANVAS_H:
-            y1 = self.CANVAS_H-h
-        return [int(x1), int(y1), int(x1+w), int(y1+h)]
-
-    def maintain_aspect_ratio_resize(self, x1, y1, x2, y2):
-        """アスペクト比を維持しながらリサイズ"""
-        orig_x1, orig_y1, orig_x2, orig_y2 = self.orig_rect
-
-        # どの角がドラッグされているかを判定
-        edges = self.resize_edge
-        new_w = x2 - x1
-        new_h = y2 - y1
-
-        # アスペクト比を維持するための調整
-        # 高さの変更に基づいて幅を調整
-        if edges["t"] or edges["b"]:
-            new_w = int(new_h * self.orig_aspect_ratio)
-            # 左右のどちらを調整するか
-            if edges["l"]:
-                x1 = x2 - new_w
-            else:
-                x2 = x1 + new_w
-        # 幅の変更に基づいて高さを調整
-        elif edges["l"] or edges["r"]:
-            new_h = int(new_w / self.orig_aspect_ratio)
-            # 上下のどちらを調整するか
-            if edges["t"]:
-                y1 = y2 - new_h
-            else:
-                y2 = y1 + new_h
-
-        return x1, y1, x2, y2
-
-    def clamp_rect_resize(self, x1, y1, x2, y2):
-        """リサイズ時に矩形をクランプ（各辺を独立に制約）"""
-        # 最小サイズを保証
-        if x2 - x1 < self.MIN_W:
-            if self.resize_edge.get("r", False):
-                x2 = x1 + self.MIN_W
-            else:
-                x1 = x2 - self.MIN_W
-        if y2 - y1 < self.MIN_H:
-            if self.resize_edge.get("b", False):
-                y2 = y1 + self.MIN_H
-            else:
-                y1 = y2 - self.MIN_H
-
-        # キャンバス範囲内に制約（片方の辺が衝突したら、反対側の辺だけ動く）
-        if x1 < 0:
-            x1 = 0
-            # 左辺が衝突した場合、右辺だけを動かす
-            if self.resize_edge.get("l", False):
-                x2 = max(x2, self.MIN_W)
-        if x2 > self.CANVAS_W:
-            x2 = self.CANVAS_W
-            # 右辺が衝突した場合、左辺だけを動かす
-            if self.resize_edge.get("r", False):
-                x1 = min(x1, self.CANVAS_W - self.MIN_W)
-
-        if y1 < 0:
-            y1 = 0
-            # 上辺が衝突した場合、下辺だけを動かす
-            if self.resize_edge.get("t", False):
-                y2 = max(y2, self.MIN_H)
-        if y2 > self.CANVAS_H:
-            y2 = self.CANVAS_H
-            # 下辺が衝突した場合、上辺だけを動かす
-            if self.resize_edge.get("b", False):
-                y1 = min(y1, self.CANVAS_H - self.MIN_H)
-
-        return [int(x1), int(y1), int(x2), int(y2)]
-
-    def inside_rect(self, x, y):
-        # スケール比とオフセットを反映した座標で判定
-        x1, y1, x2, y2 = self.crop_rect
-        scaled_x1 = int(x1 * self.canvas_scale_x) + self.canvas_offset_x
-        scaled_y1 = int(y1 * self.canvas_scale_y) + self.canvas_offset_y
-        scaled_x2 = int(x2 * self.canvas_scale_x) + self.canvas_offset_x
-        scaled_y2 = int(y2 * self.canvas_scale_y) + self.canvas_offset_y
-        return scaled_x1 <= x <= scaled_x2 and scaled_y1 <= y <= scaled_y2
-
-    def near_edge(self, x, y, m=20):
-        # スケール比とオフセットを反映した座標で判定
-        x1, y1, x2, y2 = self.crop_rect
-        scaled_x1 = int(x1 * self.canvas_scale_x) + self.canvas_offset_x
-        scaled_y1 = int(y1 * self.canvas_scale_y) + self.canvas_offset_y
-        scaled_x2 = int(x2 * self.canvas_scale_x) + self.canvas_offset_x
-        scaled_y2 = int(y2 * self.canvas_scale_y) + self.canvas_offset_y
-        # 各エッジは、そのエッジの近傍かつ対応する垂直/水平範囲内でのみ有効とする
-        left = abs(x - scaled_x1) < m and (scaled_y1 - m) <= y <= (scaled_y2 + m)
-        right = abs(x - scaled_x2) < m and (scaled_y1 - m) <= y <= (scaled_y2 + m)
-        top = abs(y - scaled_y1) < m and (scaled_x1 - m) <= x <= (scaled_x2 + m)
-        bottom = abs(y - scaled_y2) < m and (scaled_x1 - m) <= x <= (scaled_x2 + m)
-        return {"l": left, "r": right, "t": top, "b": bottom}
-
-    def canvas_mouse_to_image_coords(self, canvas_x, canvas_y):
-        """キャンバス上のマウス座標を元の画像座標系に変換"""
-        # キャンバスのオフセットを考慮
-        image_x = (canvas_x - self.canvas_offset_x) / \
-            self.canvas_scale_x if self.canvas_scale_x > 0 else canvas_x
-        image_y = (canvas_y - self.canvas_offset_y) / \
-            self.canvas_scale_y if self.canvas_scale_y > 0 else canvas_y
-        return image_x, image_y
+    # クロップ矩形のマウス操作は CropHandlerMixin のメソッドを使用します
 
     def on_mouse_down(self, e):
         edges = self.near_edge(e.x, e.y)
         if any(edges.values()):
+            if self.lock_var.get():
+                # ロック中はリサイズ不可だが、内側ならドラッグ開始（移動のみ許可）
+                if self.inside_rect(e.x, e.y):
+                    self.dragging_rect = True
+                    self._start_dragging(e)
+                return
             self.resizing_rect = True
             self.resize_edge = edges
             self.orig_rect = self.crop_rect.copy()
-            # undo 履歴に現在の矩形を登録（ドラッグ開始前）
             try:
                 self.push_crop_history()
             except Exception:
                 pass
-            # Shift キー押下時のアスペクト比ロック
-            self.maintain_aspect_ratio = (e.state & 0x1) != 0  # Shift キーのチェック
+            self.maintain_aspect_ratio = (e.state & 0x1) != 0
             if self.maintain_aspect_ratio:
                 w = self.orig_rect[2] - self.orig_rect[0]
                 h = self.orig_rect[3] - self.orig_rect[1]
                 self.orig_aspect_ratio = w / h if h > 0 else 1.0
-        elif self.inside_rect(e.x, e.y):
-            self.dragging_rect = True
-            # マウス座標を画像座標に変換してオフセットを計算
+            self.rect_focused = True
             try:
-                self.push_crop_history()
+                self.canvas.itemconfig(self.rect_id, outline='orange')
             except Exception:
                 pass
-            img_x, img_y = self.canvas_mouse_to_image_coords(e.x, e.y)
-            self.drag_offset = (
-                img_x - self.crop_rect[0], img_y - self.crop_rect[1])
+        elif self.inside_rect(e.x, e.y):
+            if self.lock_move_var.get():
+                return
+            self.dragging_rect = True
+            self._start_dragging(e)
+        else:
+            # クリックが領域外ならフォーカス解除
+            if getattr(self, 'rect_focused', False):
+                self.rect_focused = False
+                try:
+                    self.canvas.itemconfig(self.rect_id, outline='red')
+                except Exception:
+                    pass
+
+    def _start_dragging(self, e):
+        try:
+            self.push_crop_history()
+        except Exception:
+            pass
+        img_x, img_y = self.canvas_mouse_to_image_coords(e.x, e.y)
+        self.drag_offset = (img_x - self.crop_rect[0], img_y - self.crop_rect[1])
+        self.rect_focused = True
+        try:
+            self.canvas.itemconfig(self.rect_id, outline='orange')
+        except Exception:
+            pass
+
 
     def on_mouse_drag(self, e):
         if self.resizing_rect:
@@ -2208,19 +2130,51 @@ class VideoCropperApp:
             img_x, img_y = self.canvas_mouse_to_image_coords(e.x, e.y)
 
             x1, y1, x2, y2 = self.orig_rect
-            if self.resize_edge["l"]:
-                x1 = img_x
-            if self.resize_edge["r"]:
-                x2 = img_x
-            if self.resize_edge["t"]:
-                y1 = img_y
-            if self.resize_edge["b"]:
-                y2 = img_y
+            
+            # Ctrl キー押下時の対称リサイズ判定
+            try:
+                ctrl_held = (e.state & 0x4) != 0
+            except Exception:
+                ctrl_held = False
+
+            if ctrl_held:
+                # 対称リサイズ: 反対側も同じ分だけ動かす
+                if self.resize_edge["l"]:
+                    dx = img_x - x1
+                    x1 = img_x
+                    x2 = x2 - dx
+                elif self.resize_edge["r"]:
+                    dx = img_x - x2
+                    x2 = img_x
+                    x1 = x1 - dx
+                
+                if self.resize_edge["t"]:
+                    dy = img_y - y1
+                    y1 = img_y
+                    y2 = y2 - dy
+                elif self.resize_edge["b"]:
+                    dy = img_y - y2
+                    y2 = img_y
+                    y1 = y1 - dy
+            else:
+                # 通常のリサイズ
+                if self.resize_edge["l"]:
+                    x1 = img_x
+                if self.resize_edge["r"]:
+                    x2 = img_x
+                if self.resize_edge["t"]:
+                    y1 = img_y
+                if self.resize_edge["b"]:
+                    y2 = img_y
 
             # Shift キー押下時のアスペクト比ロック
+            try:
+                self.maintain_aspect_ratio = (e.state & 0x1) != 0
+            except Exception:
+                pass
             if self.maintain_aspect_ratio:
                 x1, y1, x2, y2 = self.maintain_aspect_ratio_resize(
-                    x1, y1, x2, y2)
+                    x1, y1, x2, y2, ctrl_held=ctrl_held)
 
             self.crop_rect = self.clamp_rect_resize(x1, y1, x2, y2)
 
@@ -2236,16 +2190,13 @@ class VideoCropperApp:
                 self.canvas_offset_y
             ]
             self.canvas.coords(self.rect_id, *scaled_rect)
+            # 矩形のフォーカス色を維持
+            try:
+                self.canvas.itemconfig(self.rect_id, outline='orange' if self.rect_focused else 'red')
+            except Exception:
+                pass
             # update corner handles
-            cx1, cy1, cx2, cy2 = scaled_rect
-            size = 8
-            corners = [
-                (cx1 - size//2, cy1 - size//2, cx1 + size//2, cy1 + size//2),
-                (cx2 - size//2, cy1 - size//2, cx2 + size//2, cy1 + size//2),
-                (cx1 - size//2, cy2 - size//2, cx1 + size//2, cy2 + size//2),
-                (cx2 - size//2, cy2 - size//2, cx2 + size//2, cy2 + size//2),
-            ]
-            self._update_corner_handles(corners)
+            self._update_corner_handles(self._get_corner_coords(scaled_rect))
             self.update_crop_entries()
         elif self.dragging_rect:
             # マウス座標を画像座標に変換
@@ -2269,24 +2220,35 @@ class VideoCropperApp:
                 self.canvas_offset_y
             ]
             self.canvas.coords(self.rect_id, *scaled_rect)
-            cx1, cy1, cx2, cy2 = scaled_rect
-            size = 8
-            corners = [
-                (cx1 - size//2, cy1 - size//2, cx1 + size//2, cy1 + size//2),
-                (cx2 - size//2, cy1 - size//2, cx2 + size//2, cy1 + size//2),
-                (cx1 - size//2, cy2 - size//2, cx1 + size//2, cy2 + size//2),
-                (cx2 - size//2, cy2 - size//2, cx2 + size//2, cy2 + size//2),
-            ]
-            self._update_corner_handles(corners)
+            self._update_corner_handles(self._get_corner_coords(scaled_rect))
             self.update_crop_entries()
+            try:
+                self.canvas.itemconfig(self.rect_id, outline='orange' if self.rect_focused else 'red')
+            except Exception:
+                pass
+            try:
+                self.canvas.itemconfig(self.rect_id, outline='orange' if self.rect_focused else 'red')
+            except Exception:
+                pass
 
     def on_mouse_up(self, e):
         self.dragging_rect = False
         self.resizing_rect = False
+        # ドラッグ終了時にはアスペクト比ロックを解除（再度Shiftで有効）
+        try:
+            self.maintain_aspect_ratio = False
+        except Exception:
+            pass
+        try:
+            self.canvas.itemconfig(self.rect_id, outline='orange' if self.rect_focused else 'red')
+        except Exception:
+            pass
 
     def on_right_mouse_down(self, e):
         # 右クリックで矩形を移動開始（リサイズは行わない）
         if self.inside_rect(e.x, e.y):
+            if self.lock_move_var.get():
+                return
             self.dragging_rect = True
             try:
                 self.push_crop_history()
@@ -2295,6 +2257,12 @@ class VideoCropperApp:
             img_x, img_y = self.canvas_mouse_to_image_coords(e.x, e.y)
             self.drag_offset = (
                 img_x - self.crop_rect[0], img_y - self.crop_rect[1])
+            # フォーカスを与える
+            self.rect_focused = True
+            try:
+                self.canvas.itemconfig(self.rect_id, outline='orange')
+            except Exception:
+                pass
 
     def on_right_mouse_drag(self, e):
         # 右ドラッグは矩形移動と同じ挙動
@@ -2307,26 +2275,9 @@ class VideoCropperApp:
             ny = img_y - self.drag_offset[1]
             self.crop_rect = self.clamp_rect_canvas([nx, ny, nx+w, ny+h])
 
-            scaled_rect = [
-                int(self.crop_rect[0] * self.canvas_scale_x) +
-                self.canvas_offset_x,
-                int(self.crop_rect[1] * self.canvas_scale_y) +
-                self.canvas_offset_y,
-                int(self.crop_rect[2] * self.canvas_scale_x) +
-                self.canvas_offset_x,
-                int(self.crop_rect[3] * self.canvas_scale_y) +
-                self.canvas_offset_y
-            ]
+            scaled_rect = self._scaled_rect_from_crop()
             self.canvas.coords(self.rect_id, *scaled_rect)
-            cx1, cy1, cx2, cy2 = scaled_rect
-            size = 8
-            corners = [
-                (cx1 - size//2, cy1 - size//2, cx1 + size//2, cy1 + size//2),
-                (cx2 - size//2, cy1 - size//2, cx2 + size//2, cy1 + size//2),
-                (cx1 - size//2, cy2 - size//2, cx1 + size//2, cy2 + size//2),
-                (cx2 - size//2, cy2 - size//2, cx2 + size//2, cy2 + size//2),
-            ]
-            self._update_corner_handles(corners)
+            self._update_corner_handles(self._get_corner_coords(scaled_rect))
             self.update_crop_entries()
 
     def on_right_mouse_up(self, e):
@@ -2358,6 +2309,14 @@ class VideoCropperApp:
     def on_middle_up(self, e):
         self._panning = False
 
+    def on_middle_double_click(self, e):
+        """中央ボタンのダブルクリックでズームとパンをリセット"""
+        self.image_zoom = 1.0
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
+        if self.frame is not None:
+            self.update_canvas_image()
+
     def on_canvas_wheel(self, e):
         try:
             # Windows: e.delta (positive up), X11: Button-4/5
@@ -2387,24 +2346,27 @@ class VideoCropperApp:
         # マウス移動時にカーソルを変更し、ハンドルをハイライトする
         # 角優先で判定
         edges = self.near_edge(e.x, e.y, m=10)
+        res_lock = self.lock_var.get()
+        move_lock = self.lock_move_var.get()
         cursor = ""
+        
         # corner detections
         if edges.get('l') and edges.get('t'):
-            cursor = 'top_left_corner'
+            cursor = 'circle_slash' if res_lock else 'top_left_corner'
         elif edges.get('r') and edges.get('t'):
-            cursor = 'top_right_corner'
+            cursor = 'circle_slash' if res_lock else 'top_right_corner'
         elif edges.get('l') and edges.get('b'):
-            cursor = 'bottom_left_corner'
+            cursor = 'circle_slash' if res_lock else 'bottom_left_corner'
         elif edges.get('r') and edges.get('b'):
-            cursor = 'bottom_right_corner'
+            cursor = 'circle_slash' if res_lock else 'bottom_right_corner'
         else:
             # edges only
             if edges.get('l') or edges.get('r'):
-                cursor = 'sb_h_double_arrow'
+                cursor = 'circle_slash' if res_lock else 'sb_h_double_arrow'
             elif edges.get('t') or edges.get('b'):
-                cursor = 'sb_v_double_arrow'
+                cursor = 'circle_slash' if res_lock else 'sb_v_double_arrow'
             elif self.inside_rect(e.x, e.y):
-                cursor = 'fleur'
+                cursor = 'circle_slash' if move_lock else 'fleur'
             else:
                 cursor = ''
 
@@ -2504,12 +2466,31 @@ class VideoCropperApp:
             progress_win = tk.Toplevel(self.root)
             progress_win.title("PNG 書き出し...")
             progress_win.transient(self.root)
+            progress_win.attributes("-topmost", True)
             progress_win.grab_set()
-            tk.Label(progress_win, text="PNG を出力中...").pack(padx=12, pady=(8,4))
-            pb = ttk.Progressbar(progress_win, orient=tk.HORIZONTAL, length=360, mode='determinate')
-            pb.pack(padx=12, pady=(0,8))
+            progress_win.resizable(False, False)
+            
+            # ウィンドウを一時的に隠してサイズ計算
+            progress_win.withdraw()
+            
+            tk.Label(progress_win, text="PNG を出力中...").pack(padx=20, pady=(15, 5))
+            pb = ttk.Progressbar(progress_win, orient=tk.HORIZONTAL, length=400, mode='determinate')
+            pb.pack(padx=20, pady=(0, 10))
             prog_label = tk.Label(progress_win, text="0 / 0")
-            prog_label.pack(padx=12, pady=(0,8))
+            prog_label.pack(padx=20, pady=(0, 15))
+            
+            # メインウィンドウの中央に配置
+            progress_win.update_idletasks()
+            win_w = progress_win.winfo_width()
+            win_h = progress_win.winfo_height()
+            root_x = self.root.winfo_x()
+            root_y = self.root.winfo_y()
+            root_w = self.root.winfo_width()
+            root_h = self.root.winfo_height()
+            pos_x = root_x + (root_w // 2) - (win_w // 2)
+            pos_y = root_y + (root_h // 2) - (win_h // 2)
+            progress_win.geometry(f"+{pos_x}+{pos_y}")
+            progress_win.deiconify()
         except Exception:
             progress_win = None
             pb = None
@@ -2610,7 +2591,7 @@ class VideoCropperApp:
                     try:
                         pb['value'] = step_idx
                         prog_label.config(text=f"{step_idx} / {total_steps}")
-                        progress_win.update_idletasks()
+                        progress_win.update()
                     except Exception:
                         pass
 
@@ -2620,6 +2601,15 @@ class VideoCropperApp:
             except Exception:
                 pass
             
+            # 完了ダイアログの前にウィンドウを消す
+            try:
+                if progress_win is not None:
+                    progress_win.grab_release()
+                    progress_win.destroy()
+                    progress_win = None
+            except Exception:
+                pass
+
             # 完了ダイアログとフォルダを開くかの確認
             open_now = messagebox.askyesno("完了", f"{count} images saved.\nフォルダを開きますか？")
             if open_now:

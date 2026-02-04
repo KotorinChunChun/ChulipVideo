@@ -17,7 +17,15 @@ python -m PyInstaller --noconsole --onedir --hidden-import=cv2 --hidden-import=P
 EXEを生成
 pyinstaller --noconsole --onefile --clean --noconfirm --collect-all cv2 --collect-all PIL --hidden-import=PIL._tkinter_finder --add-data "video_frame_cropper_config.json;." --add-data "README.md;." video_frame_cropper.py
 
-python -m PyInstaller --noconsole --onefile --clean --noconfirm --collect-all cv2 --collect-all PIL --hidden-import=PIL._tkinter_finder video_frame_cropper.py
+python -m PyInstaller --noconsole --onefile --clean --noconfirm --collect-all cv2 --collect-all PIL --hidden-import=PIL._tkinter_finder --add-data "README_shortcuts.md;." --add-data "README.md;." video_frame_cropper.py
+
+v0.2修正版
+python -m PyInstaller --noconsole --onefile --clean --noconfirm `
+    --collect-all cv2 --collect-all PIL `
+    --hidden-import=PIL._tkinter_finder `
+    --add-data "README_shortcuts.md;." `
+    --add-data "README.md;." `
+    video_frame_cropper.py
 
 
 いずれやること
@@ -34,3 +42,5 @@ python -m PyInstaller --noconsole --onefile --clean --noconfirm --collect-all cv
 - 選択した動画を表示する
 - 選択した複数動画に対して同じクロップ処理を適用する
 
+マウスポインタの軌跡を動画の時刻とフレームとXとY座標でテキストファイルに記録して、録画完了と同時に動画と同じ名前で同じ場所に tsv形式で保存するようにしてください。
+録画の画質が悪すぎる
