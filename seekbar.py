@@ -80,22 +80,24 @@ class SeekbarMixin:
 
         # Start Marker (Top)
         sx = self.get_x(self.start_time)
+        start_color = self.theme.get("start_color_bg")
         self.seek_canvas.create_polygon(
             sx - 8, bar_y - 8, sx + 8, bar_y - 8, sx, bar_y,
-            fill="#00aa00", outline="black"
+            fill=start_color, outline="black"
         )
         self.seek_canvas.create_text(
-            sx, bar_y - 20, text="Start", fill="#006600", font=("Arial", 8)
+            sx, bar_y - 20, text="Start", fill=start_color, font=("Arial", 8)
         )
 
         # End Marker (Bottom)
         ex = self.get_x(self.end_time)
+        end_color = self.theme.get("end_color_bg")
         self.seek_canvas.create_polygon(
             ex - 8, bar_y + 8, ex + 8, bar_y + 8, ex, bar_y,
-            fill="#cc0000", outline="black"
+            fill=end_color, outline="black"
         )
         self.seek_canvas.create_text(
-            ex, bar_y + 20, text="End", fill="#990000", font=("Arial", 8)
+            ex, bar_y + 20, text="End", fill=end_color, font=("Arial", 8)
         )
 
         # Current Thumb (Circle)

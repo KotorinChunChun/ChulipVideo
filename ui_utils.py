@@ -24,12 +24,14 @@ def add_tooltip(widget: tk.Widget, text: str) -> None:
         try:
             if getattr(widget, '_tooltip_win', None):
                 return
-            x = widget.winfo_rootx() + 20
-            y = widget.winfo_rooty() + 20
+            # ウィジェットの直下に表示するように座標を計算（重なりを防止）
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 5
             tw = tk.Toplevel(widget)
             tw.wm_overrideredirect(True)
             tw.wm_geometry(f"+{x}+{y}")
-            lbl = tk.Label(tw, text=text, background="#ffffe0", relief='solid', borderwidth=1)
+            tw.attributes("-topmost", True)
+            lbl = tk.Label(tw, text=text, background="#ffffe0", relief='solid', borderwidth=1, padx=3, pady=1)
             lbl.pack()
             widget._tooltip_win = tw
         except Exception:

@@ -90,8 +90,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.duration = 0
         self.playing = False
         self.current_time = 0
-        self.speed = 1.0
-        self.png_compression = 3 
+        self.speed = float(self.global_config.get("play_speed", 1.0))
+        self.png_compression = int(self.global_config.get("png_compression", 3))
         self.video_filename = ""  # 動画ファイル名（拡張子除く）
         self.video_filepath = ""  # 動画ファイルのフルパス
         self.vid_w = 1920 # 初期値
@@ -153,7 +153,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
         # マウス軌跡のTSVデータ用
         self.trajectory_data = [] # list of (time, x, y)
-        self.show_trajectory_var = tk.BooleanVar(value=True)
+        self.show_trajectory_var = tk.BooleanVar(value=self.global_config.get("show_trajectory", True))
 
         # UIを先に構築
         self.build_ui()
@@ -204,8 +204,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.load_config()
 
         # UI構築と設定読み込み完了後にウィンドウ位置・サイズを復元
-        # 遅延実行で確実に適用
-        self.root.after(50, self.load_window_geometry)
+        self.root.after(10, self.load_window_geometry)
 
         # 起動100ms後にレイアウト調整（シークバー等のリサイズ確実化）
         self.root.after(100, lambda: self.on_canvas_resize(None))
@@ -252,7 +251,12 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         btn_save.pack(side=tk.RIGHT, padx=2)
         self.add_tooltip(btn_save, "動画固有の設定(トリム/クロップ)を保存 (Ctrl+S)")
 
-        # 表示倍率ラベル (保存ボタンの左)
+        # FPS表示ラベル (保存ボタンの左)
+        self.label_fps = tk.Label(top_panel, text="--FPS", font=("Consolas", 10, "bold"), fg="#666666")
+        self.label_fps.pack(side=tk.RIGHT, padx=10)
+        self.add_tooltip(self.label_fps, "動画の1秒あたりのフレーム数(FPS)")
+
+        # 表示倍率ラベル (FPSボタンの左)
         self.label_zoom = tk.Label(top_panel, text="100%", font=("Consolas", 10, "bold"), fg="#666666")
         self.label_zoom.pack(side=tk.RIGHT, padx=10)
         self.add_tooltip(self.label_zoom, "現在の動画表示倍率")
@@ -331,15 +335,15 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         btn_tail = tk.Button(main_ctrl, text="末尾▶▶", command=self.go_to_video_end, width=8, bg=self.theme.get("button_normal_bg"))
         btn_tail.pack(side=tk.LEFT, padx=4)
         self.add_tooltip(btn_tail, "Ctrl+End: 動画末尾へ")
-        self.range_var = tk.BooleanVar(value=False)
+        self.range_var = tk.BooleanVar(value=self.global_config.get("play_range", False))
         tk.Checkbutton(main_ctrl, text="区間再生", variable=self.range_var).pack(side=tk.LEFT, padx=(4,8))
 
         # ループ再生チェックボックス
-        self.loop_var = tk.BooleanVar(value=False)
+        self.loop_var = tk.BooleanVar(value=self.global_config.get("play_loop", False))
         tk.Checkbutton(main_ctrl, text="ループ再生", variable=self.loop_var).pack(side=tk.LEFT, padx=(8,4))
         # 往復再生（ループがオンのときのみ有効）
-        self.pingpong_var = tk.BooleanVar(value=False)
-        self.chk_pingpong = tk.Checkbutton(main_ctrl, text="往復再生", variable=self.pingpong_var, state=tk.DISABLED)
+        self.pingpong_var = tk.BooleanVar(value=self.global_config.get("play_pingpong", False))
+        self.chk_pingpong = tk.Checkbutton(main_ctrl, text="往復再生", variable=self.pingpong_var, state=tk.NORMAL if self.loop_var.get() else tk.DISABLED)
         self.chk_pingpong.pack(side=tk.LEFT, padx=(4,8))
         self.add_tooltip(self.chk_pingpong, "ループ時のみ有効: 端で再生方向を反転")
 
@@ -353,8 +357,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.loop_var.trace_add('write', _on_loop_change)
 
         # Speed input with Spinbox
-        tk.Label(main_ctrl, text="速度:").pack(side=tk.LEFT, padx=(10, 2))
-        self.speed_var = tk.StringVar(value="1.0")
+        tk.Label(main_ctrl, text="再生速度:").pack(side=tk.LEFT, padx=(10, 2))
+        self.speed_var = tk.StringVar(value=f"{self.speed:.1f}")
         self.speed_spinbox = tk.Spinbox(
             main_ctrl,
             from_=-9.9,
@@ -365,7 +369,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             command=self.change_speed
         )
         self.speed_spinbox.pack(side=tk.LEFT, padx=5)
-        self.add_tooltip(self.speed_spinbox, "速度: -9.9〜9.9 (変更後Enter)")
+        self.add_tooltip(self.speed_spinbox, "再生速度: -9.9〜9.9 (Enterで確定)")
 
         # prevent space key from inserting into these controls (Space should toggle play)
         def _ignore_space(e):
@@ -430,7 +434,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             return entry
 
         # Start Time Control
-        self.entry_start = create_time_control(time_panel, "▼Start (開始)", "#00aa00",
+        self.entry_start = create_time_control(time_panel, "▼Start (開始)", self.theme.get("start_color_bg"),
                                lambda: self.start_time, self.set_start_time_direct, True)
 
         # Divider
@@ -443,7 +447,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         tk.Frame(time_panel, width=2, bg="#ccc", height=40).pack(side=tk.LEFT, padx=10)
 
         # End Time Control
-        self.entry_end = create_time_control(time_panel, "▲End (終了)", "#cc0000",
+        self.entry_end = create_time_control(time_panel, "▲End (終了)", self.theme.get("end_color_bg"),
                              lambda: self.end_time, self.set_end_time_direct, True)
 
         # disable space input for time entry boxes
@@ -564,9 +568,9 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         col_settings = tk.LabelFrame(output_panel, text="設定", relief=tk.FLAT)
         col_settings.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
 
-        self.check_prev_next = tk.BooleanVar(value=True)
+        self.check_prev_next = tk.BooleanVar(value=self.global_config.get("check_prev_next", True))
         tk.Checkbutton(col_settings, text="前後不一致で除外", variable=self.check_prev_next).pack(anchor=tk.W)
-        self.check_duplicate = tk.BooleanVar(value=True)
+        self.check_duplicate = tk.BooleanVar(value=self.global_config.get("check_duplicate", True))
         tk.Checkbutton(col_settings, text="直前重複で除外", variable=self.check_duplicate).pack(anchor=tk.W)
         
         # マウス軌跡チェック
@@ -697,6 +701,26 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         if not self.resolution_presets:
             from config import get_default_presets_with_labels
             self.resolution_presets = get_default_presets_with_labels()
+
+        # 各種変数の反映
+        if hasattr(self, 'compression_var'):
+            self.compression_var.set(str(self.global_config.get("png_compression", 3)))
+            self.png_compression = int(self.compression_var.get())
+        if hasattr(self, 'check_prev_next'):
+            self.check_prev_next.set(self.global_config.get("check_prev_next", True))
+        if hasattr(self, 'check_duplicate'):
+            self.check_duplicate.set(self.global_config.get("check_duplicate", True))
+        if hasattr(self, 'speed_var'):
+            self.speed_var.set(f"{float(self.global_config.get('play_speed', 1.0)):.1f}")
+            self.speed = float(self.speed_var.get())
+        if hasattr(self, 'range_var'):
+            self.range_var.set(self.global_config.get("play_range", False))
+        if hasattr(self, 'loop_var'):
+            self.loop_var.set(self.global_config.get("play_loop", False))
+        if hasattr(self, 'pingpong_var'):
+            self.pingpong_var.set(self.global_config.get("play_pingpong", False))
+        if hasattr(self, 'show_trajectory_var'):
+            self.show_trajectory_var.set(self.global_config.get("show_trajectory", True))
         
         # 現在開いている動画があれば再読み込み、なければ最後に開いた動画を読み込む
         if self.video_filepath and os.path.exists(self.video_filepath):
@@ -731,6 +755,10 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.label_seconds.config(text=f"({self.duration:.3f}s, {self.vid_w}x{self.vid_h})")
+        
+        # FPSラベルを更新
+        fps_display = f"{self.fps:.2f}".rstrip('0').rstrip('.')
+        self.label_fps.config(text=f"{fps_display}FPS")
 
         # 動画個別設定の読み込み
         per_video_settings = load_video_settings(self.video_filepath)
@@ -798,11 +826,18 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         config["resolution_presets"] = self.resolution_presets
         
         # 選択中の比率
-        try:
-            if hasattr(self, 'ratio_var'):
-                config['selected_ratio'] = self.ratio_var.get()
-        except:
-            pass
+        if hasattr(self, 'ratio_var'):
+            config['selected_ratio'] = self.ratio_var.get()
+
+        # 追加の設定項目
+        config["png_compression"] = int(self.compression_var.get()) if hasattr(self, 'compression_var') else 3
+        config["check_prev_next"] = self.check_prev_next.get() if hasattr(self, 'check_prev_next') else True
+        config["check_duplicate"] = self.check_duplicate.get() if hasattr(self, 'check_duplicate') else True
+        config["play_speed"] = float(self.speed_var.get()) if hasattr(self, 'speed_var') else 1.0
+        config["play_range"] = self.range_var.get() if hasattr(self, 'range_var') else False
+        config["play_loop"] = self.loop_var.get() if hasattr(self, 'loop_var') else False
+        config["play_pingpong"] = self.pingpong_var.get() if hasattr(self, 'pingpong_var') else False
+        config["show_trajectory"] = self.show_trajectory_var.get() if hasattr(self, 'show_trajectory_var') else True
 
         # 古いwindow_geometryフィールドを削除
         if "window_geometry" in config:
@@ -822,10 +857,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             self.crop_rect,
             self.start_time,
             self.end_time,
-            self.current_time,
-            additional_data={
-                "png_compression": int(self.compression_var.get() or 3)
-            }
+            self.current_time
         )
 
         if per_video_success:
@@ -1632,7 +1664,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             text = "■ 停止"
             bg = self.theme.get("button_stop_bg", "#EF9A9A")
         else:
-            text = "▲ 再生 (Space)"
+            text = "▲ 再生"
             bg = self.theme.get("button_play_bg", "#A5D6A7")
         self.btn_play.config(text=text, bg=bg)
 
@@ -2022,14 +2054,14 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # Start Marker (Top)
         sx = self.get_x(self.start_time)
         self.seek_canvas.create_polygon(
-            sx-8, bar_y-8, sx+8, bar_y-8, sx, bar_y, fill="#00aa00", outline="black")
+            sx-8, bar_y-8, sx+8, bar_y-8, sx, bar_y, fill=self.theme.get("start_color_bg"), outline="black")
         self.seek_canvas.create_text(
             sx, bar_y-20, text="Start", fill="#006600", font=("Arial", 8))
 
         # End Marker (Bottom)
         ex = self.get_x(self.end_time)
         self.seek_canvas.create_polygon(
-            ex-8, bar_y+8, ex+8, bar_y+8, ex, bar_y, fill="#cc0000", outline="black")
+            ex-8, bar_y+8, ex+8, bar_y+8, ex, bar_y, fill=self.theme.get("end_color_bg"), outline="black")
         self.seek_canvas.create_text(
             ex, bar_y+20, text="End", fill="#990000", font=("Arial", 8))
 
@@ -2426,23 +2458,24 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         move_lock = self.lock_move_var.get()
         cursor = ""
         
-        # corner detections
+        # 角の判定
         if edges.get('l') and edges.get('t'):
-            cursor = 'circle_slash' if res_lock else 'top_left_corner'
+            cursor = 'no' if res_lock else 'top_left_corner'
         elif edges.get('r') and edges.get('t'):
-            cursor = 'circle_slash' if res_lock else 'top_right_corner'
+            cursor = 'no' if res_lock else 'top_right_corner'
         elif edges.get('l') and edges.get('b'):
-            cursor = 'circle_slash' if res_lock else 'bottom_left_corner'
+            cursor = 'no' if res_lock else 'bottom_left_corner'
         elif edges.get('r') and edges.get('b'):
-            cursor = 'circle_slash' if res_lock else 'bottom_right_corner'
+            cursor = 'no' if res_lock else 'bottom_right_corner'
         else:
-            # edges only
+            # 辺の判定
             if edges.get('l') or edges.get('r'):
-                cursor = 'circle_slash' if res_lock else 'sb_h_double_arrow'
+                cursor = 'no' if res_lock else 'sb_h_double_arrow'
             elif edges.get('t') or edges.get('b'):
-                cursor = 'circle_slash' if res_lock else 'sb_v_double_arrow'
+                cursor = 'no' if res_lock else 'sb_v_double_arrow'
             elif self.inside_rect(e.x, e.y):
-                cursor = 'circle_slash' if move_lock else 'fleur'
+                # 内側の判定（移動）
+                cursor = 'no' if move_lock else 'fleur'
             else:
                 cursor = ''
 

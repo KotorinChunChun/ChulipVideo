@@ -106,6 +106,8 @@ def load_global_config() -> dict[str, Any]:
             "button_redo_bg": "#B3E5FC",    # 薄い青
             "button_locked_bg": "#FFAB91",   # 薄い赤（ロック中）
             "button_unlocked_bg": "#B9F6CA", # 薄い緑（解除中）
+            "start_color_bg": "#77BB77",     # 開始カラー
+            "end_color_bg": "#FF7777",       # 終了カラー
         },
         "window_x": None,
         "window_y": None,
@@ -114,7 +116,15 @@ def load_global_config() -> dict[str, Any]:
         "window_maximized": False,
         "last_video_path": "",
         "resolution_presets": {},
-        "selected_ratio": "未指定"
+        "selected_ratio": "未指定",
+        "png_compression": 3,
+        "check_prev_next": True,
+        "check_duplicate": True,
+        "play_speed": 1.0,
+        "play_range": False,
+        "play_loop": False,
+        "play_pingpong": False,
+        "show_trajectory": True
     }
 
     config_loaded = {}
