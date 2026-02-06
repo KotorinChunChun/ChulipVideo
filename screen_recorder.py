@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes
 import datetime
 import os
 import threading
@@ -20,6 +21,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from config import get_base_dir
+from ui_utils import add_tooltip
 
 if TYPE_CHECKING:
     from video_frame_cropper import VideoCropperApp
@@ -73,6 +75,10 @@ class ScreenRecorderApp:
             self.standalone = False
             
         self.root.title("録画ツール")
+        # 二重起動チェック
+        if not self._check_single_instance():
+            self.root.destroy()
+            return
         self.root.geometry("900x600")
         self.parent_app = parent_app
 
@@ -94,18 +100,23 @@ class ScreenRecorderApp:
         self.stop_event = threading.Event()
         self.preview_active = True
         
+        # マウス軌跡データ
+        self.trajectory_data = [] # (time, x, y)
+        
         # 再生状態変数
         self.cap = None
         self.is_playing = False
         self.playback_after_id = None
+        self.video_fps = 0.0
         self.video_total_frames = 0
         self.user_dragging_slider = False
         
         # UI変数
         self.source_var = tk.StringVar(value="desktop") # desktop / window
         self.target_var = tk.StringVar()
+        self.filter_var = tk.StringVar() # ウィンドウ検索用
         self.fps_var = tk.IntVar(value=15)
-        self.quality_var = tk.StringVar(value="中")
+        self.quality_var = tk.StringVar(value="最高")
         self.save_path_var = tk.StringVar(value=self.save_dir)
         self.record_cursor_var = tk.BooleanVar(value=True) # マウスポインタ録画
         self.exclusive_window_var = tk.BooleanVar(value=False) # ウィンドウ単体キャプチャ
@@ -120,8 +131,76 @@ class ScreenRecorderApp:
         self._build_ui()
         self.update_source_list()
         self._start_preview()
+        
+        # ウィンドウ状態の復元
+        self.load_window_geometry()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _check_single_instance(self) -> bool:
+        """二重起動チェック。既に起動している場合は前面に出して終了。"""
+        if not self.standalone:
+            return True
+            
+        mutex_name = "AntigravityScreenRecorder_Mutex"
+        # Mutex作成
+        self.mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+        last_error = ctypes.windll.kernel32.GetLastError()
+        
+        if last_error == 183: # ERROR_ALREADY_EXISTS
+            # 既存ウィンドウを探す
+            hwnd = ctypes.windll.user32.FindWindowW(None, "録画ツール")
+            if hwnd:
+                # 最小化していたら元に戻す
+                ctypes.windll.user32.ShowWindow(hwnd, 9) # SW_RESTORE
+                # 前面に表示
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            return False
+        return True
+
+    def load_window_geometry(self):
+        """設定からウィンドウの状態を復元."""
+        from config import load_global_config
+        config = load_global_config()
+        
+        geom = config.get("recorder_geometry")
+        if geom:
+            try:
+                self.root.geometry(geom)
+            except:
+                pass
+        
+        if config.get("recorder_maximized"):
+            try:
+                self.root.state('zoomed')
+            except:
+                pass
+                
+        sash_pos = config.get("recorder_sash_position")
+        if sash_pos is not None:
+            self.root.after(200, lambda: self.main_paned.sash_place(0, 0, sash_pos))
+
+    def save_window_geometry(self):
+        """設定にウィンドウの状態を保存."""
+        from config import load_global_config, save_global_config
+        config = load_global_config()
+        
+        config["recorder_maximized"] = (self.root.state() == 'zoomed')
+        config["recorder_geometry"] = self.root.geometry()
+        
+        try:
+            config["recorder_sash_position"] = self.main_paned.sash_coord(0)[1]
+        except:
+            pass
+            
+        save_global_config(config)
+
+    def on_close(self):
+        """終了時の処理."""
+        self.save_window_geometry()
+        self.preview_active = False
+        self.stop_event.set()
+        self.root.destroy()
 
     def _load_save_dir_from_config(self) -> str:
         # 簡易的に config.py や 親アプリのメソッドには頼らず、
@@ -173,7 +252,12 @@ class ScreenRecorderApp:
         self.btn_rename.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         self.btn_delete = tk.Button(list_ctrl, text="削除", command=self.delete_file, state=tk.DISABLED, height=1, bg=self.COLOR_BTN_DELETE)
         self.btn_delete.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        self.widgets_to_lock.extend([self.btn_rename, self.btn_delete])
+        
+        # TSVを開くボタン
+        self.btn_open_tsv = tk.Button(list_ctrl, text="TSVを開く", command=self.open_tsv_file, state=tk.DISABLED, height=1)
+        self.btn_open_tsv.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        
+        self.widgets_to_lock.extend([self.btn_rename, self.btn_delete, self.btn_open_tsv])
 
         # キーバインド
         self.file_listbox.bind("<F2>", lambda e: self.rename_file())
@@ -215,6 +299,16 @@ class ScreenRecorderApp:
         self.radio_window.pack(side=tk.LEFT, padx=10)
         self.widgets_to_lock.extend([self.radio_desktop, self.radio_window])
         
+        # 2.1 フィルター (新規追加) - ターゲット選択の上に移動
+        filter_frame = tk.Frame(self.tab_record)
+        filter_frame.pack(fill=tk.X, padx=10, pady=0)
+        tk.Label(filter_frame, text="検索:").pack(side=tk.LEFT)
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *args: self.update_source_list())
+        self.entry_filter = tk.Entry(filter_frame, textvariable=self.filter_var)
+        self.entry_filter.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.widgets_to_lock.append(self.entry_filter)
+
         # 2. ターゲット選択
         target_frame = tk.Frame(self.tab_record)
         target_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -224,9 +318,8 @@ class ScreenRecorderApp:
         self.combo_target.bind("<<ComboboxSelected>>", self.on_target_changed)
         self.btn_update = tk.Button(target_frame, text="更新", command=self.update_source_list, width=4, bg=self.COLOR_BTN_UPDATE)
         self.btn_update.pack(side=tk.LEFT)
-        self.widgets_to_lock.append(self.btn_update)
-        self.widgets_to_lock.append(self.combo_target)
-
+        self.widgets_to_lock.extend([self.btn_update, self.combo_target])
+        
         # 3. プレビュー
         preview_label_frame = tk.LabelFrame(self.tab_record, text="プレビュー")
         preview_label_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
@@ -246,16 +339,22 @@ class ScreenRecorderApp:
         self.combo_fps.pack(side=tk.LEFT, padx=5)
         
         tk.Label(settings_frame, text="画質:").pack(side=tk.LEFT, padx=(10, 0))
-        self.combo_quality = ttk.Combobox(settings_frame, textvariable=self.quality_var, values=["高", "中", "低"], width=5, state="readonly")
+        self.combo_quality = ttk.Combobox(settings_frame, textvariable=self.quality_var, values=["最高", "高", "中", "低"], width=5, state="readonly")
         self.combo_quality.pack(side=tk.LEFT, padx=5)
         self.widgets_to_lock.extend([self.combo_fps, self.combo_quality])
 
-        # 6. オプション (マウスポインタ/重なり防止)
+        # 6. オプション (マウスポインタ/重なり防止/TSV)
         options_frame = tk.Frame(self.tab_record)
         options_frame.pack(fill=tk.X, padx=10, pady=2)
-        tk.Checkbutton(options_frame, text="マウスポインタを録画する", variable=self.record_cursor_var).pack(side=tk.LEFT)
-        self.check_exclusive = tk.Checkbutton(options_frame, text="他のウィンドウの写り込みを防ぐ (Win10+)", variable=self.exclusive_window_var)
-        self.check_exclusive.pack(side=tk.LEFT, padx=(10, 0))
+        tk.Checkbutton(options_frame, text="マウスポインタ", variable=self.record_cursor_var).pack(side=tk.LEFT)
+        
+        self.record_tsv_var = tk.BooleanVar(value=True)
+        self.check_tsv = tk.Checkbutton(options_frame, text="操作履歴(TSV)", variable=self.record_tsv_var)
+        self.check_tsv.pack(side=tk.LEFT, padx=5)
+        self.widgets_to_lock.append(self.check_tsv)
+
+        self.check_exclusive = tk.Checkbutton(options_frame, text="他窓除外(Win10+)", variable=self.exclusive_window_var)
+        self.check_exclusive.pack(side=tk.LEFT, padx=5)
         self.widgets_to_lock.append(self.check_exclusive)
 
         # 7. 録画ボタン
@@ -292,12 +391,18 @@ class ScreenRecorderApp:
         self.lbl_time = tk.Label(p_btns, text="00:00 / 00:00")
         self.lbl_time.pack(side=tk.LEFT, padx=5)
 
+        # マウス軌跡の表示切り替え
+        self.show_trajectory_var = tk.BooleanVar(value=True)
+        self.chk_player_traj = tk.Checkbutton(p_btns_container, text="マウス軌跡を表示", variable=self.show_trajectory_var, command=self.refresh_player_canvas)
+        self.chk_player_traj.pack(side=tk.LEFT, padx=5)
+
         self.refresh_file_list()
 
     def update_source_list(self):
         """録画対象のリストを更新"""
         self.combo_target['values'] = []
         mode = self.source_var.get()
+        filter_text = self.filter_var.get().lower() if hasattr(self, 'filter_var') else ""
         
         if mode == 'desktop':
             # モニター一覧取得
@@ -309,6 +414,7 @@ class ScreenRecorderApp:
             self.combo_target['values'] = display_names
             if display_names:
                 self.combo_target.current(0)
+            self.entry_filter.config(state=tk.DISABLED)
                 
         elif mode == 'window':
             # ウィンドウ一覧取得 (可視ウィンドウのみ)
@@ -321,12 +427,14 @@ class ScreenRecorderApp:
                         buff = ctypes.create_unicode_buffer(length + 1)
                         ctypes.windll.user32.GetWindowTextW(hwnd, buff, length + 1)
                         title = buff.value
-                        if title:
-                            self.windows.append((hwnd, title))
+                        if title and title != "録画ツール":
+                            # 検索フィルター適用
+                            if not filter_text or filter_text in title.lower():
+                                self.windows.append((hwnd, title))
                 return True
-                
-            WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
-            ctypes.windll.user32.EnumWindows(WNDENUMPROC(enum_windows_proc), 0)
+            
+            ctypes.WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+            ctypes.windll.user32.EnumWindows(ctypes.WNDENUMPROC(enum_windows_proc), 0)
             
             display_names = []
             for h, t in self.windows:
@@ -335,7 +443,15 @@ class ScreenRecorderApp:
                 
             self.combo_target['values'] = display_names
             if display_names:
-                self.combo_target.current(0)
+                # 現在の選択がまだリストにあれば維持、なければ最初
+                curr = self.target_var.get()
+                if curr in display_names:
+                    self.combo_target.set(curr)
+                else:
+                    self.combo_target.current(0)
+            else:
+                self.target_var.set("")
+            self.entry_filter.config(state=tk.NORMAL)
         
         self.on_target_changed(None)
 
@@ -477,22 +593,20 @@ class ScreenRecorderApp:
                     if capture_success and img:
                         # キャンバスサイズに合わせてリサイズ
                         cw = self.preview_canvas.winfo_width()
-                    ch = self.preview_canvas.winfo_height()
-                    if cw > 1 and ch > 1:
-                        img.thumbnail((cw, ch), Image.Resampling.NEAREST)
-                        tk_img = ImageTk.PhotoImage(img)
-                        
-                        if self.preview_image_id:
-                            self.preview_canvas.itemconfig(self.preview_image_id, image=tk_img)
-                            self.preview_canvas.coords(self.preview_image_id, cw//2, ch//2)
-                        else:
-                            self.preview_image_id = self.preview_canvas.create_image(cw//2, ch//2, image=tk_img, anchor=tk.CENTER)
-                        
-                        # 参照保持
-                        self.preview_canvas.image = tk_img
-                    
+                        ch = self.preview_canvas.winfo_height()
+                        if cw > 1 and ch > 1:
+                            img.thumbnail((cw, ch), Image.Resampling.NEAREST)
+                            tk_img = ImageTk.PhotoImage(img)
+                            
+                            if self.preview_image_id:
+                                self.preview_canvas.itemconfig(self.preview_image_id, image=tk_img)
+                                self.preview_canvas.coords(self.preview_image_id, cw//2, ch//2)
+                            else:
+                                self.preview_image_id = self.preview_canvas.create_image(cw//2, ch//2, image=tk_img, anchor=tk.CENTER)
+                            
+                            # 参照保持
+                            self.preview_canvas.image = tk_img
                 except Exception as e:
-                    # キャプチャ失敗 (ウィンドウが最小化されている等)
                     pass
 
         # 録画中はプレビュー更新頻度を下げる、または止めるなどの調整も可
@@ -570,16 +684,31 @@ class ScreenRecorderApp:
         self._wait_for_stop()
 
     def _wait_for_stop(self):
+        """録画スレッドの終了を監視し、事後処理を行う"""
         if self.recording_thread and self.recording_thread.is_alive():
             self.root.after(100, self._wait_for_stop)
         else:
-            self.btn_record.config(text="● 録画開始", bg="#ffcccc", state=tk.NORMAL)
-            
-            # ロック解除
+            self.btn_record.config(text="録画開始", state=tk.NORMAL, bg=self.COLOR_BTN_RECORD_START)
             self._set_controls_state(tk.NORMAL)
             self._hide_recording_region()
-
-            # リストを更新して新しく録画したファイルにフォーカス
+            
+            # マウス軌跡の保存 (TSV)
+            if hasattr(self, 'trajectory_data') and self.trajectory_data and hasattr(self, 'current_out_path'):
+                tsv_path = os.path.splitext(self.current_out_path)[0] + ".tsv"
+                def save_tsv_threaded():
+                    try:
+                        with open(tsv_path, "w", encoding="utf-8") as f:
+                            f.write("timestamp\tframe\tx\ty\tclick\tkeys\n")
+                            for row in self.trajectory_data:
+                                f.write(f"{row[0]}\t{row[1]}\t{row[2]}\t{row[3]}\t{row[4]}\t{row[5]}\n")
+                    except Exception as e:
+                        print(f"TSV保存エラー: {e}")
+                
+                threading.Thread(target=save_tsv_threaded).start()
+            
+            # データのクリア
+            self.trajectory_data = []
+            
             new_fname = os.path.basename(self.current_out_path)
             self.refresh_file_list(select_filename=new_fname)
             
@@ -634,6 +763,7 @@ class ScreenRecorderApp:
 
     def _record_loop(self, filepath, rect, fps, hwnd=None):
         """録画ループ（別スレッド）"""
+        # コーデック設定 (X264が使えれば使う、なければmp4v)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         
         # 幅・高さは偶数である必要がある
@@ -646,13 +776,15 @@ class ScreenRecorderApp:
         
         interval = 1.0 / fps
         next_time = time.time() + interval
+        start_time = time.time()
+        frame_idx = 0
         
         # mss インスタンスはスレッドごとに持つ方が安全な場合がある
         with mss.mss() as sct:
             while not self.stop_event.is_set():
                 now = time.time()
                 if now >= next_time:
-                    # 追従時にDWMの正確な位置を取得するように変更
+                    # 追従時にDWMの正確な位置を取得
                     if hwnd:
                         try:
                             w_rect = ctypes.wintypes.RECT()
@@ -687,35 +819,59 @@ class ScreenRecorderApp:
                             capture_success = True
                         
                         if capture_success and frame is not None:
-                            # サイズ調整 (VideoWriterに渡すサイズと一致させる)
+                            # サイズ調整
                             if frame.shape[1] != w or frame.shape[0] != h:
                                 frame = cv2.resize(frame, (w, h))
 
-                            # マウスポインタの描画
-                            # ウィンドウキャプチャ時は座標系が異なるため、
-                            # 正確に取得するにはウィンドウ内相対座標が必要
-                            if self.record_cursor_var.get():
-                                cursor_x, cursor_y = self.root.winfo_pointerxy()
-                                if self.source_var.get() == 'window' and self.exclusive_window_var.get():
-                                    # PrintWindow時はウィンドウ左上= (0,0)
-                                    # GetWindowRect はタイトルバー等を含む
-                                    # クライアント座標にするか等検討の予地あり
-                                    rel_x = cursor_x - rect['left']
-                                    rel_y = cursor_y - rect['top']
-                                else:
-                                    rel_x = cursor_x - rect['left']
-                                    rel_y = cursor_y - rect['top']
+                            # マウス軌跡の座標取得
+                            cursor_x, cursor_y = self.root.winfo_pointerxy()
+                            
+                            # 動画内相対座標の計算
+                            if self.source_var.get() == 'window' and self.exclusive_window_var.get():
+                                rel_x = cursor_x - rect['left']
+                                rel_y = cursor_y - rect['top']
+                            else:
+                                rel_x = cursor_x - rect['left']
+                                rel_y = cursor_y - rect['top']
+                            
+                            if self.record_tsv_var.get():
+                                # クリック状態の取得 (Win32 API)
+                                click_info = ""
+                                if ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000: click_info += "L"
+                                if ctypes.windll.user32.GetAsyncKeyState(0x02) & 0x8000: click_info += "R"
+                                if ctypes.windll.user32.GetAsyncKeyState(0x04) & 0x8000: click_info += "M"
                                 
+                                # キー状態の取得
+                                keys_info = []
+                                if ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000: keys_info.append("Shift")
+                                if ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000: keys_info.append("Ctrl")
+                                if ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000: keys_info.append("Alt")
+                                if (ctypes.windll.user32.GetAsyncKeyState(0x5B) & 0x8000) or (ctypes.windll.user32.GetAsyncKeyState(0x5C) & 0x8000):
+                                    keys_info.append("Win")
+                                
+                                # 軌跡データの保存
+                                self.trajectory_data.append((
+                                    round(now - start_time, 3), 
+                                    frame_idx, 
+                                    rel_x, 
+                                    rel_y, 
+                                    click_info if click_info else "None",
+                                    ','.join(keys_info) if keys_info else "None"
+                                ))
+
+                            # 動画へのマウスポインタ直接描画 (オプション)
+                            if self.record_cursor_var.get():
                                 if 0 <= rel_x < w and 0 <= rel_y < h:
                                     cv2.circle(frame, (rel_x, rel_y), 5, (255, 255, 255), -1)
                                     cv2.circle(frame, (rel_x, rel_y), 5, (0, 0, 0), 1)
                             
                             out.write(frame)
+                            frame_idx += 1
                     except Exception as e:
                         print(f"Record Error: {e}")
                     
                     next_time += interval
-                    # スリープでCPU負荷調整 (wait time is dynamic)
+                    # スリープでCPU負荷調整
                     sleep_time = next_time - time.time()
                     if sleep_time > 0:
                         time.sleep(sleep_time)
@@ -765,12 +921,39 @@ class ScreenRecorderApp:
 
         self.on_file_select(None)
 
+    def open_tsv_file(self):
+        """選択された動画に対応するTSVファイルを関連付けプログラムで開く"""
+        indices = self.file_listbox.curselection()
+        if not indices: return
+        
+        fname = self.file_items[indices[0]]
+        path = os.path.join(self.save_dir, fname)
+        tsv_path = os.path.splitext(path)[0] + '.tsv'
+        
+        if os.path.exists(tsv_path):
+            try:
+                os.startfile(tsv_path)
+            except Exception as e:
+                messagebox.showerror("Error", f"TSVファイルを開けませんでした:\n{e}")
+        else:
+            messagebox.showwarning("Warning", "対応するTSVファイルが見つかりません。")
+
     def on_file_select(self, event):
         idx = self.file_listbox.curselection()
         if idx:
             self.btn_rename.config(state=tk.NORMAL)
             self.btn_delete.config(state=tk.NORMAL)
             self.btn_play.config(state=tk.NORMAL)
+            
+            # TSVファイルの存在確認
+            fname = self.file_items[idx[0]]
+            path = os.path.join(self.save_dir, fname)
+            tsv_path = os.path.splitext(path)[0] + '.tsv'
+            if os.path.exists(tsv_path):
+                self.btn_open_tsv.config(state=tk.NORMAL)
+            else:
+                self.btn_open_tsv.config(state=tk.DISABLED)
+                
             # 再生を停止してリセット
             self.stop_playback()
             self.load_video_for_playback()
@@ -778,6 +961,7 @@ class ScreenRecorderApp:
             self.btn_rename.config(state=tk.DISABLED)
             self.btn_delete.config(state=tk.DISABLED)
             self.btn_play.config(state=tk.DISABLED)
+            self.btn_open_tsv.config(state=tk.DISABLED)
             self.stop_playback()
             self.clear_player_canvas()
 
@@ -853,6 +1037,16 @@ class ScreenRecorderApp:
                 
                 try:
                     os.rename(old_path, new_path)
+                    
+                    # TSVファイルも連動してリネーム
+                    old_tsv = os.path.splitext(old_path)[0] + '.tsv'
+                    if os.path.exists(old_tsv):
+                        new_tsv = os.path.splitext(new_path)[0] + '.tsv'
+                        try:
+                            os.rename(old_tsv, new_tsv)
+                        except Exception as te:
+                            print(f"TSV rename error: {te}")
+                            
                     success_count += 1
                 except Exception as e:
                     print(f"Rename error for {fname}: {e}")
@@ -901,6 +1095,15 @@ class ScreenRecorderApp:
                 path = os.path.join(self.save_dir, fname)
                 try:
                     os.remove(path)
+                    
+                    # TSVファイルも連動して削除
+                    tsv_path = os.path.splitext(path)[0] + '.tsv'
+                    if os.path.exists(tsv_path):
+                        try:
+                            os.remove(tsv_path)
+                        except Exception as te:
+                            print(f"TSV delete error: {te}")
+                            
                     success_count += 1
                 except Exception as e:
                     print(f"Delete error for {fname}: {e}")
@@ -932,8 +1135,30 @@ class ScreenRecorderApp:
         self.slider.config(to=self.video_total_frames - 1)
         
         # 最初のフレームを表示
+        self.load_video_trajectory(path)
         self.show_frame(0)
         self.update_time_label(0)
+
+    def load_video_trajectory(self, video_path):
+        """再生対象の動画に紐づくマウス軌跡を読み込む."""
+        self.player_trajectory_data = []
+        tsv_path = os.path.splitext(video_path)[0] + ".tsv"
+        if os.path.exists(tsv_path):
+            try:
+                with open(tsv_path, "r", encoding="utf-8") as f:
+                    # ヘッダーを飛ばす
+                    next(f, None)
+                    for line in f:
+                        parts = line.strip().split("\t")
+                        if len(parts) >= 4:
+                            self.player_trajectory_data.append((float(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])))
+            except Exception as e:
+                print(f"Player TSV load error: {e}")
+
+    def refresh_player_canvas(self):
+        """現在のフレームを再描画（オーバーレイ更新用など）"""
+        if hasattr(self, 'last_player_frame'):
+            self.display_frame(self.last_player_frame)
 
     def toggle_playback(self):
         if self.is_playing:
@@ -1003,9 +1228,35 @@ class ScreenRecorderApp:
         if cw > 1 and ch > 1:
             img.thumbnail((cw, ch), Image.Resampling.LANCZOS)
             tk_img = ImageTk.PhotoImage(img)
-            self.player_canvas.delete("img")
+            self.player_canvas.delete("all")
             self.player_canvas.create_image(cw//2, ch//2, image=tk_img, anchor=tk.CENTER, tags="img")
             self.player_canvas.image = tk_img
+            
+            # マウス軌跡の描画
+            if self.show_trajectory_var.get() and hasattr(self, 'player_trajectory_data') and self.player_trajectory_data:
+                curr_pos = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 if self.cap else 0
+                closest = None
+                for t, f_idx, x, y in self.player_trajectory_data:
+                    if abs(t - curr_pos) < 0.1: # 0.1秒以内の誤差許容
+                        closest = (x, y)
+                        break
+                
+                if closest:
+                    vx, vy = closest
+                    img_w, img_h = img.size
+                    orig_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                    orig_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                    
+                    if orig_w > 0 and orig_h > 0:
+                        scale_x = img_w / orig_w
+                        scale_y = img_h / orig_h
+                        off_x = (cw - img_w) // 2
+                        off_y = (ch - img_h) // 2
+                        cx = vx * scale_x + off_x
+                        cy = vy * scale_y + off_y
+                        r = 6
+                        self.player_canvas.create_oval(cx-r, cy-r, cx+r, cy+r, outline="red", width=2, tags="overlay")
+                        self.player_canvas.create_oval(cx-2, cy-2, cx+2, cy+2, fill="red", tags="overlay")
 
     def _on_canvas_resize(self, mode):
         if mode == "player" and hasattr(self, 'last_player_frame'):
@@ -1015,7 +1266,7 @@ class ScreenRecorderApp:
         # preview はループが常時回っているので座標更新に任せる
 
     def update_time_label(self, curr_frame):
-        if self.video_fps > 0:
+        if hasattr(self, 'video_fps') and self.video_fps > 0:
             curr_sec = int(curr_frame / self.video_fps)
             total_sec = int(self.video_total_frames / self.video_fps)
             self.lbl_time.config(text=f"{self.format_time(curr_sec)} / {self.format_time(total_sec)}")

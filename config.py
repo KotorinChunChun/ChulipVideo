@@ -52,20 +52,125 @@ DEFAULT_PRESETS = {
 
 
 def get_config_path() -> str:
-    """設定ファイルのパスを返す."""
-    return os.path.join(get_base_dir(), CONFIG_FILENAME)
+    """設定ファイルのパスを返す. 実行ファイルと同じディレクトリ。"""
+    import sys
+    # utils.get_base_dir() と同等のロジックで実行ファイルディレクトリを取得
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, CONFIG_FILENAME)
 
 
 def load_global_config() -> dict[str, Any]:
-    """グローバル設定ファイルを読み込む."""
+    """グローバル設定ファイル（アプリ共通設定）を読み込む."""
     config_path = get_config_path()
+    theme_defaults = {
+        "theme": {
+            "main_color": "#ffcccc",
+            "active_color": "#ff9999",
+            "crop_width": 2,
+            
+            # 背景色
+            "canvas_bg": "#f5f5f5",
+            
+            # クロップ枠線の設定 (命名規則: crop_[状態]_[linecolor/linestyle])
+            "crop_default_linecolor": "#FF8C00", # 橙
+            "crop_default_linestyle": (5, 5),
+            "crop_focused_linecolor": "#FF0000",   # 赤
+            "crop_focused_linestyle": "",          # 実線
+            "crop_hover_linecolor": "#FF0000",     # 赤
+            "crop_hover_linestyle": (5, 5),        # 破線
+            
+            # 四つ角のドット設定
+            "handle_color": "#FFFFFF",
+            "handle_size": 8,
+            "edge_margin": 20,
+            
+            # ボタンの色 (パステル配色)
+            "button_play_bg": "#A5D6A7",    # 薄い緑
+            "button_stop_bg": "#EF9A9A",    # 薄い赤
+            "button_export_bg": "#F48FB1",  # 薄いピンク
+            "button_video_bg": "#81C784",   # パステル緑
+            "button_gif_bg": "#FFCC80",     # 薄い橙
+            "button_copy_bg": "#80DEEA",    # 薄いシアン
+            "button_normal_bg": "#E0E0E0",  # 明るいグレー
+            
+            # 追加ボタンの色
+            "button_help_bg": "#FFF59D",    # 薄い黄色
+            "button_reload_bg": "#FFCC80",  # 薄いオレンジ
+            "button_save_bg": "#90CAF9",    # 薄い青色
+            "button_trim_start_bg": "#EDE7F6", # 最淡パステル紫色
+            "button_trim_end_bg": "#FFEBEE",   # 最淡パステル赤色
+            "button_undo_bg": "#B3E5FC",    # 薄い青
+            "button_redo_bg": "#B3E5FC",    # 薄い青
+            "button_locked_bg": "#FFAB91",   # 薄い赤（ロック中）
+            "button_unlocked_bg": "#B9F6CA", # 薄い緑（解除中）
+        },
+        "window_x": None,
+        "window_y": None,
+        "window_width": 1000,
+        "window_height": 700,
+        "window_maximized": False,
+        "last_video_path": "",
+        "resolution_presets": {},
+        "selected_ratio": "未指定"
+    }
+
+    config_loaded = {}
+    should_update_file = False
+
     if os.path.exists(config_path):
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            if os.path.getsize(config_path) > 0:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config_loaded = json.load(f)
+            else:
+                # 0バイトファイルは破損とみなして上書きフラグを立てる
+                should_update_file = True
         except Exception as e:
             print(f"設定ファイルの読み込みに失敗しました: {e}")
-    return {}
+            # 破損している場合は初期化するために上書きフラグを立てる
+            should_update_file = True
+
+    # 古い設定名から新しい設定名への移行マッピング
+    migration_map = {
+        "crop_color_unfocused": "crop_default_linecolor",
+        "crop_unfocused_linecolor": "crop_default_linecolor",
+        "crop_color_focused": "crop_focused_linecolor",
+        "crop_dash_unfocused": "crop_default_linestyle",
+        "crop_unfocused_linestyle": "crop_default_linestyle",
+        "crop_dash_focused": "crop_focused_linestyle",
+    }
+
+    # テーマ設定内の移行と補完
+    loaded_theme = config_loaded.get("theme", {})
+    default_theme = theme_defaults["theme"]
+
+    for old_key, new_key in migration_map.items():
+        if old_key in loaded_theme and new_key not in loaded_theme:
+            loaded_theme[new_key] = loaded_theme.pop(old_key)
+            should_update_file = True
+
+    for k, v in default_theme.items():
+        if k not in loaded_theme:
+            loaded_theme[k] = v
+            should_update_file = True
+    
+    config_loaded["theme"] = loaded_theme
+
+    # グローバル項目の補完
+    for k, v in theme_defaults.items():
+        if k == "theme": continue
+        if k not in config_loaded:
+            config_loaded[k] = v
+            should_update_file = True
+
+    # 新規項目があった場合、または移行が行われた場合は保存する
+    if should_update_file:
+        save_global_config(config_loaded)
+
+    return config_loaded
 
 
 def save_global_config(config: dict[str, Any]) -> bool:
@@ -81,14 +186,7 @@ def save_global_config(config: dict[str, Any]) -> bool:
 
 
 def load_video_settings(video_filepath: str) -> dict[str, Any] | None:
-    """動画個別の設定ファイルを読み込む.
-    
-    Args:
-        video_filepath: 動画ファイルのパス
-        
-    Returns:
-        設定辞書、またはファイルが存在しない/読み込みエラーの場合None
-    """
+    """動画個別の設定ファイルを読み込む（動画ファイルと同階層）."""
     if not video_filepath:
         return None
     settings_path = os.path.splitext(video_filepath)[0] + '.settings.json'
@@ -104,20 +202,12 @@ def load_video_settings(video_filepath: str) -> dict[str, Any] | None:
 def save_video_settings(
     video_filepath: str,
     crop_rect: list[int],
-    start_time: int,
-    end_time: int
+    start_time: float,
+    end_time: float,
+    current_time: float = 0.0,
+    additional_data: dict[str, Any] | None = None
 ) -> str | None:
-    """動画個別の設定ファイルに保存する.
-    
-    Args:
-        video_filepath: 動画ファイルのパス
-        crop_rect: クロップ矩形 [x1, y1, x2, y2]
-        start_time: 開始時間（秒）
-        end_time: 終了時間（秒）
-        
-    Returns:
-        保存先パス、失敗時はNone
-    """
+    """動画個別の設定ファイルに保存する."""
     if not video_filepath:
         return None
     
@@ -130,9 +220,13 @@ def save_video_settings(
             'x2': int(crop_rect[2]),
             'y2': int(crop_rect[3])
         },
-        'start_time': int(start_time),
-        'end_time': int(end_time)
+        'start_time': start_time,
+        'end_time': end_time,
+        'current_time': current_time
     }
+    if additional_data:
+        data.update(additional_data)
+        
     try:
         with open(save_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)

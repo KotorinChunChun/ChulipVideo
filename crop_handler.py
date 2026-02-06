@@ -82,14 +82,19 @@ class CropHandlerMixin:
         y1, y2 = sorted([y1, y2])
         w = max(self.MIN_W, x2 - x1)
         h = max(self.MIN_H, y2 - y1)
+        
+        # クランプ対象の最大値を動画解像度に変更（フォールバックでキャンバス）
+        vw = getattr(self, "vid_w", self.CANVAS_W)
+        vh = getattr(self, "vid_h", self.CANVAS_H)
+
         if x1 < 0:
             x1 = 0
         if y1 < 0:
             y1 = 0
-        if x1 + w > self.CANVAS_W:
-            x1 = self.CANVAS_W - w
-        if y1 + h > self.CANVAS_H:
-            y1 = self.CANVAS_H - h
+        if x1 + w > vw:
+            x1 = vw - w
+        if y1 + h > vh:
+            y1 = vh - h
         return [int(x1), int(y1), int(x1 + w), int(y1 + h)]
 
     def maintain_aspect_ratio_resize(
@@ -145,36 +150,42 @@ class CropHandlerMixin:
         self, x1: int, y1: int, x2: int, y2: int
     ) -> list[int]:
         """リサイズ時に矩形をクランプする（各辺を独立に制約）."""
+        # 動画の実際の解像度を取得（フォールバックとしてCANVAS値）
+        vw = getattr(self, "vid_w", self.CANVAS_W)
+        vh = getattr(self, "vid_h", self.CANVAS_H)
+        
+        edges = self.resize_edge or {}
+
         # 最小サイズを保証
         if x2 - x1 < self.MIN_W:
-            if self.resize_edge.get("r", False):
+            if edges.get("r", False):
                 x2 = x1 + self.MIN_W
             else:
                 x1 = x2 - self.MIN_W
         if y2 - y1 < self.MIN_H:
-            if self.resize_edge.get("b", False):
+            if edges.get("b", False):
                 y2 = y1 + self.MIN_H
             else:
                 y1 = y2 - self.MIN_H
 
-        # キャンバス範囲内に制約
+        # 動画解像度の範囲内に制約
         if x1 < 0:
             x1 = 0
-            if self.resize_edge.get("l", False):
+            if edges.get("l", False):
                 x2 = max(x2, self.MIN_W)
-        if x2 > self.CANVAS_W:
-            x2 = self.CANVAS_W
-            if self.resize_edge.get("r", False):
-                x1 = min(x1, self.CANVAS_W - self.MIN_W)
+        if x2 > vw:
+            x2 = vw
+            if edges.get("r", False):
+                x1 = min(x1, vw - self.MIN_W)
 
         if y1 < 0:
             y1 = 0
-            if self.resize_edge.get("t", False):
+            if edges.get("t", False):
                 y2 = max(y2, self.MIN_H)
-        if y2 > self.CANVAS_H:
-            y2 = self.CANVAS_H
-            if self.resize_edge.get("b", False):
-                y1 = min(y1, self.CANVAS_H - self.MIN_H)
+        if y2 > vh:
+            y2 = vh
+            if edges.get("b", False):
+                y1 = min(y1, vh - self.MIN_H)
 
         return [int(x1), int(y1), int(x2), int(y2)]
 
@@ -221,18 +232,21 @@ class CropHandlerMixin:
         new_y2 = y2 + dy
         
         # 範囲チェック
+        vw = getattr(self, "vid_w", self.CANVAS_W)
+        vh = getattr(self, "vid_h", self.CANVAS_H)
+        
         if new_x1 < 0:
             new_x1 = 0
             new_x2 = x2 - x1
         if new_y1 < 0:
             new_y1 = 0
             new_y2 = y2 - y1
-        if new_x2 > self.CANVAS_W:
-            new_x2 = self.CANVAS_W
-            new_x1 = self.CANVAS_W - (x2 - x1)
-        if new_y2 > self.CANVAS_H:
-            new_y2 = self.CANVAS_H
-            new_y1 = self.CANVAS_H - (y2 - y1)
+        if new_x2 > vw:
+            new_x2 = vw
+            new_x1 = vw - (x2 - x1)
+        if new_y2 > vh:
+            new_y2 = vh
+            new_y1 = vh - (y2 - y1)
         
         self.crop_rect = [int(new_x1), int(new_y1), int(new_x2), int(new_y2)]
         self._sync_crop_rect_ui()

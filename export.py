@@ -107,10 +107,13 @@ class ExportMixin:
         x1, y1, x2, y2 = self.crop_rect
         vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        sx = vid_w / self.CANVAS_W
-        sy = vid_h / self.CANVAS_H
-        vx1, vy1 = int(x1 * sx), int(y1 * sy)
-        vx2, vy2 = int(x2 * sx), int(y2 * sy)
+        vx1, vy1, vx2, vy2 = [int(v) for v in self.crop_rect]
+        
+        # 安全のためクランプ
+        vx1 = max(0, min(vid_w, vx1))
+        vy1 = max(0, min(vid_h, vy1))
+        vx2 = max(0, min(vid_w, vx2))
+        vy2 = max(0, min(vid_h, vy2))
 
         was_playing = self.playing
         self.playing = False
@@ -272,6 +275,104 @@ class ExportMixin:
             if self.playing:
                 self.play_step()
 
+    def export_gif(self) -> None:
+        """クロップ範囲をGIFとして出力する(ffmpeg使用)."""
+        if not self.cap or not self.video_filepath:
+            messagebox.showerror("Error", "動画なし")
+            return
+
+        # 保存先の決定
+        now = time.strftime("%Y%m%d_%H%M%S")
+        default_name = f"{self.video_filename}_{now}.gif"
+        video_dir = os.path.dirname(self.video_filepath)
+        save_path = filedialog.asksaveasfilename(
+            defaultextension='.gif',
+            initialfile=default_name,
+            initialdir=video_dir,
+            filetypes=[('GIF', '*.gif')],
+            title='GIFの保存先を選択'
+        )
+        if not save_path:
+            return
+
+        # 座標変換
+        x1, y1, x2, y2 = self.crop_rect
+        vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        vx1, vy1, vx2, vy2 = [int(v) for v in self.crop_rect]
+        
+        # 安全のためクランプ
+        vx1 = max(0, min(vid_w, vx1))
+        vy1 = max(0, min(vid_h, vy1))
+        vx2 = max(0, min(vid_w, vx2))
+        vy2 = max(0, min(vid_h, vy2))
+
+        vw = vx2 - vx1
+        vh = vy2 - vy1
+
+        if vw <= 0 or vh <= 0:
+            messagebox.showerror("Error", "有効な範囲を選択してください")
+            return
+
+        # プログレスバー表示用
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("GIF 書き出し中...")
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        tk.Label(progress_win, text="ffmpeg で高品質 GIF を生成しています...").pack(padx=20, pady=20)
+        pb = ttk.Progressbar(progress_win, mode='indeterminate', length=250)
+        pb.pack(padx=20, pady=(0, 20))
+        pb.start()
+
+        def _run():
+            try:
+                # 高品質GIF生成のためのコマンド (パレット生成 -> パレット使用)
+                # 一旦ワークディレクトリにパレットを出力
+                palette_path = os.path.join(os.path.dirname(save_path), ".palette.png")
+                # クロップ設定
+                crop_str = f"crop={vw}:{vh}:{vx1}:{vy1}"
+                # 時間指定
+                ss = self.start_time
+                t_dur = self.end_time - self.start_time
+                
+                # 1. パレット作成
+                cmd_palette = [
+                    'ffmpeg', '-y', '-ss', str(ss), '-t', str(t_dur),
+                    '-i', self.video_filepath,
+                    '-vf', f"{crop_str},palettegen",
+                    palette_path
+                ]
+                subprocess.run(cmd_palette, capture_output=True, check=True)
+
+                # 2. GIF生成
+                cmd_gif = [
+                    'ffmpeg', '-y', '-ss', str(ss), '-t', str(t_dur),
+                    '-i', self.video_filepath,
+                    '-i', palette_path,
+                    '-filter_complex', f"[0:v]{crop_str}[v];[v][1:v]paletteuse",
+                    save_path
+                ]
+                subprocess.run(cmd_gif, capture_output=True, check=True)
+
+                if os.path.exists(palette_path):
+                    os.remove(palette_path)
+
+                def _done():
+                    progress_win.destroy()
+                    if messagebox.askyesno("完了", "GIF保存が完了しました。フォルダを開きますか？"):
+                        open_folder(os.path.dirname(save_path))
+                
+                self.root.after(0, _done)
+
+            except Exception as e:
+                def _error():
+                    progress_win.destroy()
+                    messagebox.showerror("Error", f"GIFの生成に失敗しました:\n{e}")
+                self.root.after(0, _error)
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
+
     def export_video(self) -> None:
         """赤枠範囲をstart時間からend時間まで動画ファイルとして出力する."""
         if not self.cap:
@@ -300,10 +401,13 @@ class ExportMixin:
         x1, y1, x2, y2 = self.crop_rect
         vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        sx = vid_w / self.CANVAS_W
-        sy = vid_h / self.CANVAS_H
-        vx1, vy1 = int(x1 * sx), int(y1 * sy)
-        vx2, vy2 = int(x2 * sx), int(y2 * sy)
+        vx1, vy1, vx2, vy2 = [int(v) for v in self.crop_rect]
+
+        # 安全のためクランプ
+        vx1 = max(0, min(vid_w, vx1))
+        vy1 = max(0, min(vid_h, vy1))
+        vx2 = max(0, min(vid_w, vx2))
+        vy2 = max(0, min(vid_h, vy2))
 
         # クロップ後のサイズ
         crop_w = vx2 - vx1
@@ -319,40 +423,73 @@ class ExportMixin:
         if self._play_after_id:
             self.root.after_cancel(self._play_after_id)
 
-        try:
-            # VideoWriter の設定
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(save_path, fourcc, self.fps, (crop_w, crop_h))
+        # Create progress dialog
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("動画を書き出し中...")
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+        
+        tk.Label(progress_win, text="動画を保存しています...").pack(padx=20, pady=(15, 5))
+        pb = ttk.Progressbar(progress_win, orient=tk.HORIZONTAL, length=400, mode='determinate')
+        pb.pack(padx=20, pady=(0, 10))
+        prog_label = tk.Label(progress_win, text="0 / 0")
+        prog_label.pack(padx=20, pady=(0, 15))
 
-            if not out.isOpened():
-                messagebox.showerror("Error", "動画ファイルを作成できませんでした")
-                return
+        def _run_export():
+            try:
+                # VideoWriter の設定
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(save_path, fourcc, self.fps, (crop_w, crop_h))
 
-            # start_time から end_time までのフレームを処理
-            t = self.start_time
-            limit = self.end_time
-            frame_interval = 1.0 / self.fps
-            frame_count = 0
+                if not out.isOpened():
+                    self.root.after(0, lambda: messagebox.showerror("Error", "動画ファイルを作成できませんでした"))
+                    self.root.after(0, progress_win.destroy)
+                    return
 
-            while t <= limit:
-                self.cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-                ret, frm = self.cap.read()
-                if ret and frm is not None:
-                    crop = frm[vy1:vy2, vx1:vx2]
-                    if crop.size > 0:
-                        out.write(crop)
-                        frame_count += 1
-                t += frame_interval
+                # start_time から end_time までのフレームを処理
+                t = self.start_time
+                limit = self.end_time
+                frame_interval = 1.0 / self.fps
+                total_frames = int((limit - t) / frame_interval) + 1
+                
+                self.root.after(0, lambda: pb.config(maximum=total_frames))
+                
+                frame_count = 0
+                while t <= limit:
+                    self.cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                    ret, frm = self.cap.read()
+                    if ret and frm is not None:
+                        crop = frm[vy1:vy2, vx1:vx2]
+                        if crop.size > 0:
+                            # サイズが合わない場合はリサイズ (端数の関係でズレることがある)
+                            if crop.shape[1] != crop_w or crop.shape[0] != crop_h:
+                                crop = cv2.resize(crop, (crop_w, crop_h))
+                            out.write(crop)
+                            frame_count += 1
+                    t += frame_interval
+                    
+                    # プログレス更新
+                    curr_c = frame_count
+                    self.root.after(0, lambda c=curr_c: pb.step(1) or prog_label.config(text=f"{c} / {total_frames}"))
 
-            out.release()
+                out.release()
 
-            # 完了ダイアログとフォルダを開くかの確認
-            open_now = messagebox.askyesno("完了", f"動画を保存しました。\n{frame_count} フレーム\nフォルダを開きますか？")
-            if open_now:
-                open_folder(save_dir)
-        except Exception as e:
-            messagebox.showerror("Error", f"動画保存中にエラーが発生しました:\n{e}")
-        finally:
-            self.playing = was_playing
-            if self.playing:
-                self.play_step()
+                def _finish():
+                    progress_win.destroy()
+                    if messagebox.askyesno("完了", f"動画を保存しました。\n{frame_count} フレーム\nフォルダを開きますか？"):
+                        open_folder(save_dir)
+                
+                self.root.after(0, _finish)
+                
+            except Exception as e:
+                def _err():
+                    progress_win.destroy()
+                    messagebox.showerror("Error", f"動画保存中にエラーが発生しました:\n{e}")
+                self.root.after(0, _err)
+            finally:
+                self.root.after(0, lambda: setattr(self, 'playing', was_playing))
+                if was_playing:
+                    self.root.after(0, self.play_step)
+
+        import threading
+        threading.Thread(target=_run_export, daemon=True).start()

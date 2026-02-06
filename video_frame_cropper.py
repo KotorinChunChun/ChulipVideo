@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -8,6 +9,7 @@ import tkinter as tk
 import tkinter.ttk as ttk
 from tkinter import filedialog, messagebox, simpledialog
 from typing import TYPE_CHECKING, Any, Callable
+import sys
 
 import cv2
 import screen_recorder
@@ -36,10 +38,15 @@ from clipboard import copy_image_to_clipboard
 from seekbar import SeekbarMixin
 from crop_handler import CropHandlerMixin
 from export import ExportMixin
+from ui_utils import add_tooltip as _add_tooltip, fix_button_active_colors
 
 
 class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
     """動画のクロップと出力を行うGUIアプリケーション."""
+
+    # ウィンドウの最小サイズ
+    MIN_WINDOW_W: int = 800
+    MIN_WINDOW_H: int = 600
 
     # キャンバスサイズ
     CANVAS_W: int = 640
@@ -54,17 +61,27 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
     SEEK_H: int = 100
     SEEK_MARGIN: int = 20
 
-    # 矩形リサイズハンドルのサイズとエッジ判定マージン
+    # 矩形リサイズハンドルのサイズとエッジ判定マージン(デフォルト値、設定ファイルで上書き可能)
     HANDLE_SIZE: int = 8
     EDGE_MARGIN: int = 20
 
+    # 下側パネルの固定高さ
+    BOTTOM_PANEL_FIXED_HEIGHT: int = 450
+
     def __init__(self, root):
         self.root = root
-        self.root.title("動画クリップ取得ツール - Created By ことりちゅん - v0.2")
+        self.root.title("動画クリップ取得ツール - Created By ことりちゅん - v0.2.2")
+        
+        # Load global config for theme
+        self.global_config = load_global_config()
+        self.theme = self.global_config.get("theme", {})
+        
+        # テーマ設定からハンドルサイズとエッジマージンを取得
+        self.HANDLE_SIZE = self.theme.get("handle_size")
+        self.EDGE_MARGIN = self.theme.get("edge_margin")
 
-        # ウィンドウサイズと最小サイズの初期値（縦は小さくしてキャンバスを縮められるように）
-        # 起動時にUI全体が見えるよう最小高さを少し小さくする
-        self.root.minsize(800, 360)
+        # ウィンドウの最小サイズを設定
+        self.root.minsize(self.MIN_WINDOW_W, self.MIN_WINDOW_H)
 
         # ビデオ / 再生状態
         self.cap = None
@@ -77,6 +94,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.png_compression = 3 
         self.video_filename = ""  # 動画ファイル名（拡張子除く）
         self.video_filepath = ""  # 動画ファイルのフルパス
+        self.vid_w = 1920 # 初期値
+        self.vid_h = 1080
 
         # トリム時間
         self.start_time = 0
@@ -93,6 +112,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.orig_aspect_ratio = 1.0  # 元のアスペクト比
         # 矩形のフォーカス状態（左クリックでオレンジにする）
         self.rect_focused = False
+        # 矩形のホバー状態
+        self.rect_hovered = False
 
         # Seekbar dragging state
         self.drag_mode = None  # "current", "start", "end"
@@ -130,9 +151,11 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # ツールチップ用のストレージ
         self._tooltips = {}
 
-        # 設定ファイルを読み込んでウィンドウ位置・サイズを復元
-        self.load_window_geometry()
+        # マウス軌跡のTSVデータ用
+        self.trajectory_data = [] # list of (time, x, y)
+        self.show_trajectory_var = tk.BooleanVar(value=True)
 
+        # UIを先に構築
         self.build_ui()
 
         self._play_after_id = None
@@ -155,22 +178,24 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.root.bind_all('<KeyRelease-Left>', lambda e: self._on_arrow_release(e))
         self.root.bind_all('<KeyPress-Right>', lambda e: self._on_arrow_press(e, 1))
         self.root.bind_all('<KeyRelease-Right>', lambda e: self._on_arrow_release(e))
-        # Alt+矢印でクロップ矩形を1px移動
-        # return "break" to stop further handling (avoid double-handling)
-        self.root.bind_all('<Alt-Up>', lambda e: (self.move_crop_by(0, -1) or "break"))
-        self.root.bind_all('<Alt-Down>', lambda e: (self.move_crop_by(0, 1) or "break"))
-        self.root.bind_all('<Alt-Left>', lambda e: (self.move_crop_by(-1, 0) or "break"))
-        self.root.bind_all('<Alt-Right>', lambda e: (self.move_crop_by(1, 0) or "break"))
-        # Shift+矢印でクロップ矩形を拡大縮小（上下で高さ、左右で幅を2pxずつ）
-        self.root.bind_all('<Shift-Up>', lambda e: (self.expand_crop(0, 1) or "break"))
-        self.root.bind_all('<Shift-Down>', lambda e: (self.expand_crop(0, -1) or "break"))
-        self.root.bind_all('<Shift-Left>', lambda e: (self.expand_crop(-1, 0) or "break"))
-        self.root.bind_all('<Shift-Right>', lambda e: (self.expand_crop(1, 0) or "break"))
+        # Alt+矢印でクロップ矩形を移動（Ctrl併用で10px）
+        self.root.bind_all('<Alt-Up>', lambda e: (self.move_crop_by(0, -10 if (e.state & 0x4) else -1) or "break"))
+        self.root.bind_all('<Alt-Down>', lambda e: (self.move_crop_by(0, 10 if (e.state & 0x4) else 1) or "break"))
+        self.root.bind_all('<Alt-Left>', lambda e: (self.move_crop_by(-10 if (e.state & 0x4) else -1, 0) or "break"))
+        self.root.bind_all('<Alt-Right>', lambda e: (self.move_crop_by(10 if (e.state & 0x4) else 1, 0) or "break"))
+        # Shift+矢印でクロップ矩形を拡大縮小（Ctrl併用で10px）
+        self.root.bind_all('<Shift-Up>', lambda e: (self.expand_crop(0, 10 if (e.state & 0x4) else 1) or "break"))
+        self.root.bind_all('<Shift-Down>', lambda e: (self.expand_crop(0, -10 if (e.state & 0x4) else -1) or "break"))
+        self.root.bind_all('<Shift-Left>', lambda e: (self.expand_crop(-10 if (e.state & 0x4) else -1, 0) or "break"))
+        self.root.bind_all('<Shift-Right>', lambda e: (self.expand_crop(10 if (e.state & 0x4) else 1, 0) or "break"))
         # Home/End bindings
         self.root.bind_all('<Home>', lambda e: self.set_current_time_direct(self.start_time))
         self.root.bind_all('<End>', lambda e: self.set_current_time_direct(self.end_time))
         self.root.bind_all('<Control-Home>', lambda e: self.set_current_time_direct(0))
         self.root.bind_all('<Control-End>', lambda e: self.set_current_time_direct(self.duration))
+        # Ctrl+Sで現在のクロップ範囲をPNGとして保存
+        self.root.bind_all('<Control-s>', lambda e: self.save_current_frame_as_png())
+        self.root.bind_all('<Control-S>', lambda e: self.save_current_frame_as_png())
 
         # ウィンドウ終了時に設定を保存
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
@@ -178,18 +203,28 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # 動画設定を読み込む
         self.load_config()
 
+        # UI構築と設定読み込み完了後にウィンドウ位置・サイズを復元
+        # 遅延実行で確実に適用
+        self.root.after(50, self.load_window_geometry)
+
+        # 起動100ms後にレイアウト調整（シークバー等のリサイズ確実化）
+        self.root.after(100, lambda: self.on_canvas_resize(None))
+
     # ---------------- UI Construction ----------------
     def build_ui(self):
         # Top: Load path and controls
         top_panel = tk.Frame(self.root)
         top_panel.pack(fill=tk.X, side=tk.TOP, padx=5, pady=3)
 
-        # 録画ツール起動ボタン (赤系)
+        # 録画ツール起動ボタン (赤系 -> Theme)
+        btn_bg = self.theme.get("main_color")
         tk.Button(top_panel, text="録画ツール", command=self.open_screen_recorder,
-                  bg="#ffcccc", width=10).pack(side=tk.LEFT, padx=5)
+                  bg=btn_bg, width=10).pack(side=tk.LEFT, padx=5)
 
-        tk.Button(top_panel, text="動画を開く", command=self.load_video,
-                  width=10).pack(side=tk.LEFT, padx=5)
+        btn_open = tk.Button(top_panel, text="動画を選択", command=self.load_video,
+                  width=10, bg=self.theme.get("button_normal_bg"))
+        btn_open.pack(side=tk.LEFT, padx=5)
+        self.add_tooltip(btn_open, "動画ファイルを開く")
 
         self.entry_fullpath_var = tk.StringVar(value="")
         self.entry_fullpath = tk.Entry(top_panel, textvariable=self.entry_fullpath_var)
@@ -200,17 +235,56 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.label_seconds.pack(side=tk.LEFT, padx=5)
 
         # 右上のヘルプボタン（ショートカット一覧）
-        self.btn_help = tk.Button(top_panel, text="?", command=self.show_shortcuts, width=3)
+        self.btn_help = tk.Button(top_panel, text="?", command=self.show_shortcuts, width=3, bg=self.theme.get("button_help_bg"))
         self.btn_help.pack(side=tk.RIGHT, padx=4)
         self.add_tooltip(self.btn_help, "ショートカット一覧を表示")
 
-        # 1. Video Canvas (拡大縮小対応)
+        # 動画設定ボタン(右上端の「?」の左に並べる)
+        btn_reload = tk.Button(top_panel, text="再読込", command=self.load_config, width=8, bg=self.theme.get("button_reload_bg"))
+        btn_reload.pack(side=tk.RIGHT, padx=2)
+        self.add_tooltip(btn_reload, "設定を再読み込み (Ctrl+R)")
+        
+        btn_check = tk.Button(top_panel, text="設定確認", command=self.open_video_settings, width=8, bg=self.theme.get("button_normal_bg"))
+        btn_check.pack(side=tk.RIGHT, padx=2)
+        self.add_tooltip(btn_check, "動画固有の現在の設定値を表示")
+        
+        btn_save = tk.Button(top_panel, text="設定保存", command=self.save_video_settings, width=8, bg=self.theme.get("button_save_bg"))
+        btn_save.pack(side=tk.RIGHT, padx=2)
+        self.add_tooltip(btn_save, "動画固有の設定(トリム/クロップ)を保存 (Ctrl+S)")
+
+        # 表示倍率ラベル (保存ボタンの左)
+        self.label_zoom = tk.Label(top_panel, text="100%", font=("Consolas", 10, "bold"), fg="#666666")
+        self.label_zoom.pack(side=tk.RIGHT, padx=10)
+        self.add_tooltip(self.label_zoom, "現在の動画表示倍率")
+
+        # 1. Main Container (Replacing PanedWindow to lock the split)
+        # 以前は PanedWindow を使用していましたが、下側パネルの高さを 450px に固定し、
+        # ユーザーによる変更を不可にするため、通常の Frame パックに変更しました。
+        
+        # 2. Control Panel Frame (先に BOTTOM で pack して高さを固定)
+        control_pane = tk.Frame(self.root, bg="#f5f5f5", height=self.BOTTOM_PANEL_FIXED_HEIGHT)
+        control_pane.pack(side=tk.BOTTOM, fill=tk.X)
+        control_pane.pack_propagate(False) # 子要素に寄らず高さを固定
+        
+        # 1.1 Video Canvas Pane (残りの領域をすべて埋める)
+        canvas_pane = tk.Frame(self.root)
+        canvas_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # キャンバスの背景色をテーマから取得
+        canvas_bg = self.theme.get("canvas_bg")
         self.canvas = tk.Canvas(
-            self.root, width=self.CANVAS_W, height=self.CANVAS_H, bg="black")
+            canvas_pane, width=self.CANVAS_W, height=self.CANVAS_H, bg=canvas_bg)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas_image = self.canvas.create_image(0, 0, anchor=tk.NW)
+        linecolor = self.theme.get("crop_default_linecolor")
+        width = self.theme.get("crop_width")
+        linestyle = self.theme.get("crop_default_linestyle")
+        # tkinter の dash 引数として適切な型(tuple)に変換
+        if isinstance(linestyle, list):
+            linestyle = tuple(linestyle)
+
         self.rect_id = self.canvas.create_rectangle(
-            *self.crop_rect, outline="red", width=2)
+            *self.crop_rect, outline=linecolor, width=width, dash=linestyle)
 
         self.canvas.bind("<ButtonPress-1>", self.on_mouse_down)
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
@@ -231,30 +305,30 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.canvas.bind("<Button-4>", self.on_canvas_wheel)
         self.canvas.bind("<Button-5>", self.on_canvas_wheel)
 
-        # 2. Control Panel Frame (固定サイズ、一つのフレームに格納)
-        control_frame = tk.Frame(self.root, bg="#f5f5f5")
-        control_frame.pack(fill=tk.X, side=tk.BOTTOM)
+        
+        control_frame = tk.Frame(control_pane, bg="#f5f5f5")
+        control_frame.pack(fill=tk.BOTH, expand=True)
 
         # 2. Main Controls (Play, Speed)
         main_ctrl = tk.Frame(control_frame)
         main_ctrl.pack(pady=2)
 
-        self.btn_video_start = tk.Button(main_ctrl, text="◀◀先頭", command=self.go_to_video_start, width=8)
+        self.btn_video_start = tk.Button(main_ctrl, text="◀◀先頭", command=self.go_to_video_start, width=8, bg=self.theme.get("button_normal_bg"))
         self.btn_video_start.pack(side=tk.LEFT, padx=4)
         self.add_tooltip(self.btn_video_start, "Ctrl+Home: 動画先頭へ")
-        self.btn_trim_start = tk.Button(main_ctrl, text="◀開始位置", command=self.go_to_trim_start, width=10)
+        self.btn_trim_start = tk.Button(main_ctrl, text="◀開始位置", command=self.go_to_trim_start, width=10, bg=self.theme.get("button_trim_start_bg"))
         self.btn_trim_start.pack(side=tk.LEFT, padx=4)
         self.add_tooltip(self.btn_trim_start, "Home: 開始位置へ")
 
-        self.btn_play = tk.Button(main_ctrl, text="▲再生", command=self.toggle_play, width=12)
+        self.btn_play = tk.Button(main_ctrl, text="▲再生", command=self.toggle_play, width=12, bg=self.theme.get("button_play_bg"))
         # 区間再生はチェックボックス化（末尾ボタンの右）
         self.btn_play.pack(side=tk.LEFT, padx=4)
         self.add_tooltip(self.btn_play, "Space: 再生/停止")
 
-        btn_end = tk.Button(main_ctrl, text="終了位置▶", command=self.go_to_trim_end, width=10)
+        btn_end = tk.Button(main_ctrl, text="終了位置▶", command=self.go_to_trim_end, width=10, bg=self.theme.get("button_trim_end_bg"))
         btn_end.pack(side=tk.LEFT, padx=4)
         self.add_tooltip(btn_end, "End: 終了位置へ")
-        btn_tail = tk.Button(main_ctrl, text="末尾▶▶", command=self.go_to_video_end, width=8)
+        btn_tail = tk.Button(main_ctrl, text="末尾▶▶", command=self.go_to_video_end, width=8, bg=self.theme.get("button_normal_bg"))
         btn_tail.pack(side=tk.LEFT, padx=4)
         self.add_tooltip(btn_tail, "Ctrl+End: 動画末尾へ")
         self.range_var = tk.BooleanVar(value=False)
@@ -334,7 +408,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             # ラベルと入力欄の間に少し余白を入れる
             ctrl_f.pack(pady=3)
 
-            btn_minus = tk.Button(ctrl_f, text="-1s", width=4,
+            btn_minus = tk.Button(ctrl_f, text="-1s", width=4, bg=color if add_move else self.theme.get("button_normal_bg"),
                       command=lambda: self.adjust_time(var_getter, var_setter, -1))
             btn_minus.pack(side=tk.LEFT)
             self.add_tooltip(btn_minus, "-1s: 1秒戻す")
@@ -348,7 +422,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             entry.bind("<FocusOut>", lambda e: self.manual_entry_update(
                 entry, var_setter))
 
-            btn_plus = tk.Button(ctrl_f, text="+1s", width=4,
+            btn_plus = tk.Button(ctrl_f, text="+1s", width=4, bg=color if add_move else self.theme.get("button_normal_bg"),
                       command=lambda: self.adjust_time(var_getter, var_setter, 1))
             btn_plus.pack(side=tk.LEFT)
             self.add_tooltip(btn_plus, "+1s: 1秒進める")
@@ -387,12 +461,13 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         size_ctrl.pack()
 
         # 戻すボタン（Undo）
-        self.btn_undo = tk.Button(size_ctrl, text="戻す", command=self.undo_crop, width=6)
+        # 幅を文字数に合わせ、fontを調整して中央配置を確実にする
+        self.btn_undo = tk.Button(size_ctrl, text="↩️", command=self.undo_crop, width=4, font=("Segoe UI Emoji", 12), bg=self.theme.get("button_undo_bg"), relief=tk.RAISED)
         self.btn_undo.pack(side=tk.LEFT, padx=4)
         self.btn_undo.config(state=tk.DISABLED)
         self.add_tooltip(self.btn_undo, "Ctrl+Z: 戻す")
         # 進むボタン（Redo）
-        self.btn_redo = tk.Button(size_ctrl, text="進む", command=self.redo_crop, width=6)
+        self.btn_redo = tk.Button(size_ctrl, text="↪️", command=self.redo_crop, width=4, font=("Segoe UI Emoji", 12), bg=self.theme.get("button_redo_bg"), relief=tk.RAISED)
         self.btn_redo.pack(side=tk.LEFT, padx=4)
         self.btn_redo.config(state=tk.DISABLED)
         self.add_tooltip(self.btn_redo, "Ctrl+Y: 進む")
@@ -400,14 +475,14 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # 座標パネルラベルとロックボタン
         ttk.Separator(size_ctrl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
         tk.Label(size_ctrl, text="座標:").pack(side=tk.LEFT, padx=(5,0))
-        self.btn_lock_move = tk.Button(size_ctrl, text="🔓", width=3, font=("Consolas", 14, "bold"), bg="#ccffcc", command=self.toggle_move_lock)
+        self.btn_lock_move = tk.Button(size_ctrl, text="🔓", width=3, font=("Consolas", 14, "bold"), bg=self.theme.get("button_unlocked_bg"), command=self.toggle_move_lock)
         self.btn_lock_move.pack(side=tk.LEFT, padx=(2,5))
         self.add_tooltip(self.btn_lock_move, "クロップ位置(X, Y)をロック (リサイズは可能)")
 
         # X座標入力
         tk.Label(size_ctrl, text="X:").pack(side=tk.LEFT, padx=2)
         self.entry_crop_x = tk.Entry(
-            size_ctrl, width=8, font=("Consolas", 10), justify="center")
+            size_ctrl, width=8, font=("Consolas", 12), justify="center")
         self.entry_crop_x.insert(0, "100")
         self.entry_crop_x.pack(side=tk.LEFT, padx=2)
         self.entry_crop_x.bind(
@@ -419,7 +494,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # Y座標入力
         tk.Label(size_ctrl, text="Y:").pack(side=tk.LEFT, padx=5)
         self.entry_crop_y = tk.Entry(
-            size_ctrl, width=8, font=("Consolas", 10), justify="center")
+            size_ctrl, width=8, font=("Consolas", 12), justify="center")
         self.entry_crop_y.insert(0, "80")
         self.entry_crop_y.pack(side=tk.LEFT, padx=2)
         self.entry_crop_y.bind(
@@ -432,7 +507,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         ttk.Separator(size_ctrl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
         tk.Label(size_ctrl, text="解像度:").pack(side=tk.LEFT, padx=5)
         # 解像度ロックボタン
-        self.btn_lock_res = tk.Button(size_ctrl, text="🔓", width=3, font=("Consolas", 14, "bold"), bg="#ccffcc", command=self.toggle_resolution_lock)
+        self.btn_lock_res = tk.Button(size_ctrl, text="🔓", width=3, font=("Consolas", 14, "bold"), bg=self.theme.get("button_unlocked_bg"), command=self.toggle_resolution_lock)
         self.btn_lock_res.pack(side=tk.LEFT, padx=(2,5))
         self.add_tooltip(self.btn_lock_res, "解像度・アスペクト比をロック (移動は可能)")
 
@@ -449,7 +524,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # 幅入力
         tk.Label(size_ctrl, text="幅:").pack(side=tk.LEFT, padx=5)
         self.entry_crop_w = tk.Entry(
-            size_ctrl, width=8, font=("Consolas", 10), justify="center")
+            size_ctrl, width=8, font=("Consolas", 12), justify="center")
         self.entry_crop_w.insert(0, "200")
         self.entry_crop_w.pack(side=tk.LEFT, padx=2)
         self.entry_crop_w.bind(
@@ -461,7 +536,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # 高さ入力
         tk.Label(size_ctrl, text="高:").pack(side=tk.LEFT, padx=5)
         self.entry_crop_h = tk.Entry(
-            size_ctrl, width=8, font=("Consolas", 10), justify="center")
+            size_ctrl, width=8, font=("Consolas", 12), justify="center")
         self.entry_crop_h.insert(0, "170")
         self.entry_crop_h.pack(side=tk.LEFT, padx=2)
         self.entry_crop_h.bind(
@@ -471,373 +546,292 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.add_tooltip(self.entry_crop_h, "出力される画像の高さ (ピクセル)")
 
         # プリセット保存/削除ボタン
-        self.btn_save_preset = tk.Button(size_ctrl, text="プリセット保存", command=self.add_resolution_preset)
-        self.btn_save_preset.pack(side=tk.LEFT, padx=4)
-        self.btn_delete_preset = tk.Button(size_ctrl, text="プリセット削除", command=self.delete_resolution_preset)
-        self.btn_delete_preset.pack(side=tk.LEFT, padx=4)
+        self.btn_save_preset = tk.Button(size_ctrl, text="プリセット保存", command=self.add_resolution_preset, bg=self.theme.get("button_reload_bg"))
+        self.btn_save_preset.pack(side=tk.LEFT, padx=2)
+        self.add_tooltip(self.btn_save_preset, "現在の解像度をプリセットに追加")
+        
+        self.btn_delete_preset = tk.Button(size_ctrl, text="プリセット削除", command=self.delete_resolution_preset, bg=self.theme.get("button_undo_bg"))
+        self.btn_delete_preset.pack(side=tk.LEFT, padx=2)
+        self.add_tooltip(self.btn_delete_preset, "選択中のプリセットを削除")
 
         
 
-        # 5. 出力グループ（PNG出力・動画保存・フィルタ）
-        # 出力パネルも他のパネルと同じ罫線デザインに揃える
-        output_panel = tk.LabelFrame(control_frame, text="出力", bd=1, relief=tk.SOLID, padx=5, pady=5)
+        # 5. 出力グループ（設定、PNG、動画/GIF）の3列構成
+        output_panel = tk.LabelFrame(control_frame, text="エクスポート", bd=1, relief=tk.SOLID, padx=5, pady=5)
         output_panel.pack(fill=tk.X, padx=10, pady=5)
 
-        # 左側: フィルタ + 保存ボタン
-        left_out = tk.Frame(output_panel)
-        left_out.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=4)
+        # 列1: 設定
+        col_settings = tk.LabelFrame(output_panel, text="設定", relief=tk.FLAT)
+        col_settings.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
 
-        filter_panel = tk.Frame(left_out)
-        filter_panel.pack(side=tk.TOP, fill=tk.X)
         self.check_prev_next = tk.BooleanVar(value=True)
-        tk.Checkbutton(filter_panel, text="前後のフレームと異なるとき出力しない",
-                       variable=self.check_prev_next).pack(side=tk.LEFT, padx=5)
-
+        tk.Checkbutton(col_settings, text="前後不一致で除外", variable=self.check_prev_next).pack(anchor=tk.W)
         self.check_duplicate = tk.BooleanVar(value=True)
-        tk.Checkbutton(filter_panel, text="直前に出力したフレームと同一のとき出力しない",
-                       variable=self.check_duplicate).pack(side=tk.LEFT, padx=5)
+        tk.Checkbutton(col_settings, text="直前重複で除外", variable=self.check_duplicate).pack(anchor=tk.W)
+        
+        # マウス軌跡チェック
+        self.chk_traj = tk.Checkbutton(col_settings, text="マウス軌跡を表示", variable=self.show_trajectory_var, command=self.update_canvas_overlay)
+        self.chk_traj.pack(anchor=tk.W)
 
-        # 設定保存 / 設定確認 ボタン
-        tk.Button(left_out, text="設定保存", command=self.save_video_settings).pack(side=tk.LEFT, padx=6, pady=4)
-        tk.Button(left_out, text="設定確認", command=self.open_video_settings).pack(side=tk.LEFT, padx=6, pady=4)
-        self.btn_reload_settings = tk.Button(left_out, text="設定再読み込み", command=self.load_config)
-        self.btn_reload_settings.pack(side=tk.LEFT, padx=6, pady=4)
-        self.add_tooltip(self.btn_reload_settings, "設定ファイルを再読み込み")
+        # 列2: 静止画出力
+        col_png = tk.LabelFrame(output_panel, text="静止画出力", relief=tk.FLAT)
+        col_png.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
 
-        # 右側: 出力操作（右下にまとめる）
-        right_out = tk.Frame(output_panel)
-        right_out.pack(side=tk.RIGHT, anchor=tk.S, padx=6, pady=4)
-        # PNG圧縮設定（右寄せでPNG出力の近くへ）
-        comp_frame_r = tk.Frame(right_out)
-        comp_frame_r.pack(side=tk.TOP, anchor=tk.E)
-        tk.Label(comp_frame_r, text="PNG圧縮:").pack(side=tk.LEFT, padx=(0,4))
+        self.btn_copy_image = tk.Button(col_png, text="🖼️ クリップボードにコピー", command=self.copy_crop_to_clipboard, bg=self.theme.get("button_copy_bg"), height=2)
+        self.btn_copy_image.pack(fill=tk.X, pady=2)
+        self.add_tooltip(self.btn_copy_image, "Ctrl+C: 現在のフレームをクリップボードにコピー")
+
+        # 圧縮と連番保存を横並びに
+        png_btns_f = tk.Frame(col_png)
+        png_btns_f.pack(fill=tk.X, pady=2)
+
+        tk.Label(png_btns_f, text="PNG圧縮:").pack(side=tk.LEFT)
         self.compression_var = tk.StringVar(value=str(self.png_compression))
-        self.compression_spinbox = tk.Spinbox(
-            comp_frame_r,
-            from_=0,
-            to=9,
-            increment=1,
-            width=3,
-            textvariable=self.compression_var,
-            command=self.change_compression
-        )
-        self.compression_spinbox.pack(side=tk.LEFT)
-        self.compression_spinbox.bind("<Return>", self.change_compression)
-        self.compression_spinbox.bind("<FocusOut>", self.change_compression)
+        self.compression_spinbox = tk.Spinbox(png_btns_f, from_=0, to=9, increment=1, width=3, textvariable=self.compression_var, command=self.change_compression)
+        self.compression_spinbox.pack(side=tk.LEFT, padx=3)
 
-        # Copy button + PNG output grouped
-        png_btn_frame = tk.Frame(right_out)
-        png_btn_frame.pack(side=tk.TOP, anchor=tk.E, pady=2)
-        self.btn_copy_image = tk.Button(png_btn_frame, text="🖼️コピー", width=12, command=self.copy_crop_to_clipboard)
-        self.btn_copy_image.pack(side=tk.LEFT, padx=(0,6))
-        self.add_tooltip(self.btn_copy_image, "Ctrl+C: 現在のクロップをコピー")
-        self.btn_export_png = tk.Button(png_btn_frame, text="PNG出力", width=12, command=self.export_png, bg="#ffdddd")
-        self.btn_export_png.pack(side=tk.LEFT)
-        self.add_tooltip(self.btn_export_png, "PNG出力（フォルダ選択）")
+        self.btn_export_png = tk.Button(png_btns_f, text="PNG連番保存", command=self.export_png, bg=self.theme.get("button_export_bg"))
+        self.btn_export_png.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+        self.add_tooltip(self.btn_export_png, "指定範囲をPNG連番で保存")
 
-        tk.Button(right_out, text="動画保存", width=24, command=self.export_video, bg="#ddffdd").pack(side=tk.TOP, anchor=tk.E, pady=2)
+        # 列3: 動画出力
+        col_video = tk.LabelFrame(output_panel, text="動画出力", relief=tk.FLAT)
+        col_video.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+
+        self.btn_export_video = tk.Button(col_video, text="MP4 動画保存", command=self.export_video, bg=self.theme.get("button_video_bg"), height=2)
+        self.btn_export_video.pack(side=tk.TOP, fill=tk.X, pady=2)
+        self.add_tooltip(self.btn_export_video, "選択範囲をMP4動画としてエクスポート (V)")
+        
+        self.btn_export_gif = tk.Button(col_video, text="GIF アニメ保存", command=self.export_gif, bg=self.theme.get("button_gif_bg"))
+        self.btn_export_gif.pack(side=tk.TOP, fill=tk.X, pady=2)
+        self.add_tooltip(self.btn_export_gif, "選択範囲をGIFアニメとしてエクスポート (G)")
+
+        # 全ボタンの activebackground を背景色に設定して色戻りを修正
+        self._fix_all_button_active_colors(output_panel)
+        self._fix_all_button_active_colors(main_ctrl)
+        self._fix_all_button_active_colors(time_panel)
+        self._fix_all_button_active_colors(crop_panel)
+        self._fix_all_button_active_colors(top_panel)
 
         # 解像度プリセットをメニューに反映
         self.update_resolution_menu()
 
     # ------------------ ウィンドウ位置・サイズ管理 ------------------
+    def _fix_all_button_active_colors(self, container):
+        """コンテナ内の全ボタンの activebackground を背景色に合わせる."""
+        fix_button_active_colors(container)
+
     def load_window_geometry(self):
-        """設定ファイルからウィンドウの位置とサイズを読み込む"""
-        config_path = os.path.join(get_base_dir(), CONFIG_FILENAME)
-        # デフォルト起動ジオメトリ（UIがウィンドウ内に収まるよう縦を抑える）
-        default_geometry = "860x600"
-
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-
-                window_geom = config.get("window_geometry", "")
-                if window_geom:
-                    # ジオメトリが有効かチェック (0でない値であることを確認)
-                    try:
-                        # ジオメトリをパースしてサイズをチェック
-                        parts = window_geom.split('+')
-                        size_part = parts[0].split('x')
-                        width = int(size_part[0])
-                        height = int(size_part[1])
-                        if width > 0 and height > 0:
-                            self.root.geometry(window_geom)
-                            return
-                    except:
-                        pass
-            except Exception as e:
-                print(f"ウィンドウ設定の読み込みに失敗しました: {e}")
-
-        # デフォルト値を使用
-        self.root.geometry(default_geometry)
+        """設定ファイルからウィンドウの位置とサイズ、分割位置を読み込む"""
+        config = load_global_config()
+        
+        # ウィンドウサイズと位置を個別に取得
+        width = config.get("window_width", 1000)
+        height = config.get("window_height", 700)
+        x = config.get("window_x")
+        y = config.get("window_y")
+        
+        # ジオメトリ文字列を構築（負の座標にも対応）
+        if x is not None and y is not None:
+            # 負の値の場合は自動的に-記号が付くので、+/-を適切に処理
+            x_sign = '+' if x >= 0 else ''
+            y_sign = '+' if y >= 0 else ''
+            geometry = f"{width}x{height}{x_sign}{x}{y_sign}{y}"
+        else:
+            geometry = f"{width}x{height}"
+        
+        try:
+            self.root.geometry(geometry)
+            # ウィンドウの描画を確実にする
+            self.root.update_idletasks()
+        except Exception as e:
+            print(f"ジオメトリ設定エラー: {e}, geometry={geometry}")
+            self.root.geometry("1000x700")
+        # 最大化状態
+        if config.get("window_maximized", False):
+            self.root.state('zoomed')
+    
 
     def save_window_geometry(self):
-        """ウィンドウの位置とサイズをvideo_frame_cropper_config.jsonに保存"""
-        config_path = os.path.join(get_base_dir(), CONFIG_FILENAME)
+        """ウィンドウの状態を保存"""
+        config = load_global_config()
 
-        try:
-            # 既存の設定を読み込む
-            config = {}
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
+        # 最大化状態
+        is_zoomed = (self.root.state() == 'zoomed')
+        config["window_maximized"] = is_zoomed
+        
+        # ウィンドウの位置とサイズを個別に保存
+        if not is_zoomed:
+            # 最大化されていない場合のみ位置とサイズを保存
+            config["window_x"] = self.root.winfo_x()
+            config["window_y"] = self.root.winfo_y()
+            config["window_width"] = self.root.winfo_width()
+            config["window_height"] = self.root.winfo_height()
+        
+        # 下側パネルの高さはコード定数なので保存しない
+        if "bottom_panel_height" in config:
+            del config["bottom_panel_height"]
 
-            # ウィンドウジオメトリを保存
-            config["window_geometry"] = self.root.geometry()
+        # 分割位置は固定なので保存しない
+        if "sash_position" in config:
+            del config["sash_position"]
 
-            # 設定をファイルに保存
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"ウィンドウ設定の保存に失敗しました: {e}")
+        save_global_config(config)
 
     def on_window_close(self):
         """ウィンドウ終了時の処理"""
         self.save_window_geometry()
+        # メイン設定も保存
+        self.save_config()
         self.root.destroy()
 
     # ------------------ 設定管理 ------------------
     def load_config(self):
         """設定ファイルから初期値を読み込む"""
-        config_path = os.path.join(get_base_dir(), CONFIG_FILENAME)
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
+        # アプリ共通設定の読み込み
+        self.global_config = load_global_config()
+        self.theme = self.global_config.get("theme", {})
+        
+        # プリセットの読み込み (config.pyから)
+        self.resolution_presets = self.global_config.get("resolution_presets")
+        if not self.resolution_presets:
+            from config import get_default_presets_with_labels
+            self.resolution_presets = get_default_presets_with_labels()
+        
+        # 現在開いている動画があれば再読み込み、なければ最後に開いた動画を読み込む
+        if self.video_filepath and os.path.exists(self.video_filepath):
+            # 再読み込みボタン用: 現在の動画を完全に再初期化
+            self._load_video_internal(self.video_filepath)
+        else:
+            # 起動時: 最後に開いた動画があれば読み込む
+            last_video = self.global_config.get("last_video_path", "")
+            if last_video and os.path.exists(last_video):
+                self._load_video_internal(last_video)
+            else:
+                self.update_resolution_menu()
 
-                # 動画ファイルが存在する場合は読み込む
-                video_file = config.get("video_file", "")
-                if video_file and os.path.exists(video_file):
-                    self.cap = cv2.VideoCapture(video_file)
-                    if self.cap.isOpened():
-                        self.video_filename = os.path.splitext(
-                            os.path.basename(video_file))[0]
-                        self.video_filepath = os.path.abspath(video_file)
-                        self.fps = float(self.cap.get(
-                            cv2.CAP_PROP_FPS) or 30.0)
-                        frames = int(self.cap.get(
-                            cv2.CAP_PROP_FRAME_COUNT) or 0)
-                        self.duration = max(
-                            0, int(round(frames / self.fps))) if self.fps > 0 else 0
+    def _load_video_internal(self, video_file):
+        """動画ファイルを読み込み、個別設定を反映させる"""
+        if self.cap:
+            self.cap.release()
+            
+        self.cap = cv2.VideoCapture(video_file)
+        if not self.cap.isOpened():
+            return False
 
-                        # まず、動画ごとの設定ファイル（<video>.settings.json）があれば優先して読み込む
-                        per_video_settings = None
-                        try:
-                            settings_path = os.path.splitext(video_file)[0] + '.settings.json'
-                            if os.path.exists(settings_path):
-                                with open(settings_path, 'r', encoding='utf-8') as sf:
-                                    per_video_settings = json.load(sf)
-                        except Exception:
-                            per_video_settings = None
+        self.video_filename = os.path.splitext(os.path.basename(video_file))[0]
+        self.video_filepath = os.path.abspath(video_file)
+        self.entry_fullpath_var.set(self.video_filepath)
+        
+        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        frame_count = self.cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        self.duration = frame_count / self.fps if self.fps > 0 else 0
 
-                        if per_video_settings:
-                            crop_rect = per_video_settings.get('crop_rect', {})
-                            self.start_time = per_video_settings.get('start_time', 0)
-                            self.end_time = per_video_settings.get('end_time', self.duration)
-                        else:
-                                        # グローバル設定(video_frame_cropper_config.json)から読み込む
-                            crop_rect = config.get("crop_rect", {})
-                            self.start_time = config.get("start_time", 0)
-                            self.end_time = config.get("end_time", self.duration)
+        # 動画情報を保存
+        self.vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.label_seconds.config(text=f"({self.duration:.3f}s, {self.vid_w}x{self.vid_h})")
 
-                        if crop_rect:
-                            self.crop_rect = [
-                                crop_rect.get("x1", 100),
-                                crop_rect.get("y1", 80),
-                                crop_rect.get("x2", 300),
-                                crop_rect.get("y2", 250)
-                            ]
+        # 動画個別設定の読み込み
+        per_video_settings = load_video_settings(self.video_filepath)
 
-                        self.current_time = self.start_time
-                        # UIを更新 - スケールされた座標で矩形とハンドルを更新
-                        try:
-                            scaled = self._scaled_rect_from_crop()
-                            self.canvas.coords(self.rect_id, *scaled)
-                            self._update_corner_handles(self._get_corner_coords(scaled))
-                        except Exception:
-                            self.canvas.coords(self.rect_id, *self.crop_rect)
-                        # フルパス表示と秒数表示を更新
-                        try:
-                            self.entry_fullpath_var.set(os.path.abspath(video_file))
-                        except Exception:
-                            pass
-                        try:
-                            self.label_seconds.config(text=f"({self.duration}s)")
-                        except Exception:
-                            pass
-                        self.show_frame_at(self.current_time)
-                        self.update_ui_texts()
-                        self.update_crop_entries()
-                        try:
-                            self.draw_seekbar()
-                        except Exception:
-                            pass
 
-                # 解像度プリセットがあれば読み込む、なければデフォルトを作成して保存
-                presets = config.get("resolution_presets")
-                default_presets = {
-                    "160×120（カスタム）": [160, 120],
-                    "320×240（QVGA）": [320, 240],
-                    "480×320（HVGA）": [480, 320],
-                    "640×480（VGA）": [640, 480],
-                    "800×600（SVGA）": [800, 600],
-                    "1024×768（XGA）": [1024, 768],
-                    "1600×1200（UXGA）": [1600, 1200],
-                    "426×240（SD 240p）": [426, 240],
-                    "640×360（SD 360p）": [640, 360],
-                    "854×480（SD 480p）": [854, 480],
-                    "1280×720（HD 720p）": [1280, 720],
-                    "1366×768（WXGA）": [1366, 768],
-                    "1920×1080（FHD 1080p）": [1920, 1080],
-                    "2560×1440（2K 1440p）": [2560, 1440],
-                    "3840×2160（4K 2160p）": [3840, 2160],
-                    "1080×1080（Instagram Feed）": [1080, 1080],
-                    "1080×1920（Instagram Story）": [1080, 1920],
-                    "1080×1920（TikTok）": [1080, 1920],
-                    "1280×720（YouTube Thumbnail）": [1280, 720],
-                    "1500×500（Twitter ヘッダー画像）": [1500, 500],
-                    "400×400（Twitterプロフィール画像)": [400, 400],
-                    "1200×675（Twitter 通常投稿・横長)": [1200, 675],
-                    "1200×1200（Twitter 通常投稿・正方形)": [1200, 1200],
-                    "1200×1500（Twitter 通常投稿・縦長)": [1200, 1500],
-                    "1600×900（Twitter リンクカード大）": [1600, 900],
-                    "800×800（Twitter リンクカード小）": [800, 800],
-                    "1080×1080（Twitter 広告・正方形）": [1080, 1080],
-                    "1920×1080（Twitter 広告・横長）": [1920, 1080],
-                    "1200×628（Facebook Post）": [1200, 628],
-                    "1080×1920（YouTube Short）": [1080, 1920],
-                    "1080×1920（縦FHD 1080p）": [1080, 1920],
-                    "32×32（1:1 アイコン）": [32, 32],
-                    "1080×1080（1:1）": [1080, 1080],
-                }
-                if isinstance(presets, dict) and presets:
-                    # 既存プリセットのキーが比率プレフィックスを含まない場合は付与して統一する
-                    new_presets = {}
-                    import re
-                    for k, v in presets.items():
-                        if re.match(r'^\d+:\d+\s', str(k)):
-                            new_presets[k] = v
-                        else:
-                            try:
-                                w, h = int(v[0]), int(v[1])
-                                lbl = None
-                                try:
-                                    lbl = self._ratio_label_from_wh(w, h)
-                                except Exception:
-                                    lbl = f"{w}:{h}"
-                                new_key = f"{lbl} {k}"
-                                # avoid collision
-                                if new_key in new_presets:
-                                    # append suffix
-                                    idx = 1
-                                    while f"{new_key}#{idx}" in new_presets:
-                                        idx += 1
-                                    new_key = f"{new_key}#{idx}"
-                                new_presets[new_key] = v
-                            except Exception:
-                                new_presets[k] = v
-                    self.resolution_presets = new_presets
-                else:
-                    # 設定ファイルにプリセットがなければデフォルトを初期書き込み
-                    # デフォルトのキーに比率ラベルを付与して保存
-                    new_defaults = {}
-                    for k, v in default_presets.items():
-                        try:
-                            w, h = int(v[0]), int(v[1])
-                            lbl = self._ratio_label_from_wh(w, h)
-                            new_key = f"{lbl} {k}"
-                        except Exception:
-                            new_key = k
-                        new_defaults[new_key] = v
-                    self.resolution_presets = new_defaults
-                    try:
-                        self.save_config()
-                    except Exception:
-                        pass
-                # 読み込んだ設定から選択中の比率を復元（UI が構築済みであることが前提）
-                try:
-                    sel_ratio = config.get("selected_ratio", "未指定")
-                    if hasattr(self, 'ratio_var'):
-                        try:
-                            self.ratio_var.set(sel_ratio)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                try:
-                    self.update_resolution_menu()
-                except Exception:
-                    pass
-
-            except Exception as e:
-                print(f"設定ファイルの読み込みに失敗しました: {e}")
+        if per_video_settings:
+            crop_rect_data = per_video_settings.get('crop_rect', {})
+            self.start_time = float(per_video_settings.get('start_time', 0))
+            self.end_time = float(per_video_settings.get('end_time', self.duration))
+            # 現在の再生位置を復元（保存されていない場合は開始位置）
+            self.current_time = float(per_video_settings.get('current_time', self.start_time))
+            if crop_rect_data:
+                # 設定ファイルが古い（640x360基準）か新しい（ピクセル基準）かを簡易判定
+                # 幅が640以下の場合は古い可能性があるが、ユーザーが小さいクロップを指定している場合と区別が難しい。
+                # ここでは一度すべてピクセル基準として扱う（不整合が出る場合はユーザーに再設定してもらうのが安全）
+                self.crop_rect = [
+                    crop_rect_data.get("x1", self.vid_w // 4),
+                    crop_rect_data.get("y1", self.vid_h // 4),
+                    crop_rect_data.get("x2", self.vid_w * 3 // 4),
+                    crop_rect_data.get("y2", self.vid_h * 3 // 4)
+                ]
+        else:
+            # 個別設定がない場合はデフォルト値（中央付近）
+            self.start_time = 0
+            self.end_time = self.duration
+            self.current_time = 0
+            self.crop_rect = [self.vid_w//4, self.vid_h//4, self.vid_w*3//4, self.vid_h*3//4]
+        self.update_resolution_menu()
+        self.update_ui_texts()
+        self.update_crop_entries()
+        self.draw_seekbar()
+        self.show_frame_at(self.current_time)
+        self.load_trajectory()
+        
+        self.global_config["last_video_path"] = self.video_filepath
+        save_global_config(self.global_config)
+        return True
 
     def save_config(self):
-        """設定ファイルへ現在の重要設定を保存（マージして保存）"""
-        config_path = os.path.join(get_base_dir(), "video_frame_cropper_config.json")
-        config = {}
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-            except Exception:
-                config = {}
-
-        # 更新する値
-        config["video_file"] = self.video_filepath or config.get("video_file", "")
-        config["crop_rect"] = {
-            "x1": int(self.crop_rect[0]),
-            "y1": int(self.crop_rect[1]),
-            "x2": int(self.crop_rect[2]),
-            "y2": int(self.crop_rect[3])
-        }
-        config["start_time"] = int(self.start_time)
-        config["end_time"] = int(self.end_time)
+        """アプリ共通設定を保存する (ウィンドウジオメトリ、最後に開いた動画、解像度プリセット等)"""
+        config = load_global_config()
+        
+        # 最大化状態なら解除してジオメトリを取得（でないと前回の位置が取れない場合がある）
+        is_zoomed = (self.root.state() == 'zoomed')
+        config["window_maximized"] = is_zoomed
+        
+        # ウィンドウの位置とサイズを個別に保存
+        if not is_zoomed:
+            config["window_x"] = self.root.winfo_x()
+            config["window_y"] = self.root.winfo_y()
+            config["window_width"] = self.root.winfo_width()
+            config["window_height"] = self.root.winfo_height()
+        
+        # 下側パネルの高さは定数化されたため保存不要。
+        # 既存のキーがあれば削除しておく
+        if "bottom_panel_height" in config:
+            del config["bottom_panel_height"]
+        if "sash_position" in config:
+            del config["sash_position"]
+            
+        # 最後に開いた動画
+        config["last_video_path"] = self.video_filepath if self.video_filepath else ""
+        
+        # 解像度プリセット
         config["resolution_presets"] = self.resolution_presets
-        # 選択中の比率を保存
+        
+        # 選択中の比率
         try:
             if hasattr(self, 'ratio_var'):
                 config['selected_ratio'] = self.ratio_var.get()
-            else:
-                config['selected_ratio'] = '未指定'
-        except Exception:
-            config['selected_ratio'] = '未指定'
+        except:
+            pass
 
-        try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"設定ファイルの保存に失敗しました: {e}")
+        # 古いwindow_geometryフィールドを削除
+        if "window_geometry" in config:
+            del config["window_geometry"]
+
+        save_global_config(config)
+
 
     def save_video_settings(self):
-        """当該動画ファイルに紐づく設定ファイルへ現在の赤枠・開始・終了を保存する"""
+        """当該動画ファイルに紐づく設定ファイルへ現在の設定（赤枠・時間等）を保存する"""
         if not self.video_filepath:
-            # 動画が選択されていない場合はファイルを選んで保存場所を決める
-            path = filedialog.asksaveasfilename(defaultextension='.json', filetypes=[('JSON','*.json')], title='設定ファイルの保存先を選択')
-            if not path:
-                return
-            save_path = path
-        else:
-            base = os.path.splitext(self.video_filepath)[0]
-            save_path = base + '.settings.json'
+            messagebox.showwarning("Warning", "動画が読み込まれていません")
+            return
 
-        data = {
-            'video_file': self.video_filepath,
-            'crop_rect': {
-                'x1': int(self.crop_rect[0]), 'y1': int(self.crop_rect[1]),
-                'x2': int(self.crop_rect[2]), 'y2': int(self.crop_rect[3])
-            },
-            'start_time': int(self.start_time),
-            'end_time': int(self.end_time)
-        }
-        try:
-            with open(save_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            messagebox.showinfo('Saved', f'設定を保存しました:\n{save_path}')
-        except Exception as e:
-            messagebox.showerror('Error', f'設定の保存に失敗しました:\n{e}')
+        per_video_success = save_video_settings_to_file(
+            self.video_filepath,
+            self.crop_rect,
+            self.start_time,
+            self.end_time,
+            self.current_time,
+            additional_data={
+                "png_compression": int(self.compression_var.get() or 3)
+            }
+        )
+
+        if per_video_success:
+            messagebox.showinfo("Saved", f"動画個別の設定を保存しました:\n{per_video_success}")
+        else:
+            messagebox.showerror("Error", "個別設定の保存に失敗しました")
 
     def update_resolution_menu(self):
         """OptionMenu を現在の self.resolution_presets に合わせて更新する"""
@@ -929,13 +923,40 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         """日本語パス対応の画像保存関数（utils.imwrite_jp に委譲）"""
         return imwrite_jp(filename, img, params)
 
-    # ------------------ ヘルパー: 時間変換 (utils モジュールに委譲) ------------------
-    def sec_to_hhmmss(self, sec):
-        return sec_to_hhmmss(sec)
 
-    def sec_to_display(self, sec):
-        """表示用: HH:MM:SS.mmm (ミリ秒まで)"""
-        return sec_to_display(sec)
+    def save_current_frame_as_png(self):
+        """現在のフレームを指定された矩形で切り抜いて保存する (Ctrl+S用)"""
+        if self.frame is None:
+            return
+
+        # クロップ矩形を動画の座標系に変換
+        x1, y1, x2, y2 = self.crop_rect
+        x1 = max(0, int(round(x1)))
+        y1 = max(0, int(round(y1)))
+        x2 = min(self.frame.shape[1], int(round(x2)))
+        y2 = min(self.frame.shape[0], int(round(y2)))
+
+        if x2 <= x1 or y2 <= y1:
+            messagebox.showwarning("Warning", "有効なクロップ範囲が選択されていません。")
+            return
+
+        # 切り抜き
+        cropped = self.frame[y1:y2, x1:x2]
+        
+        # 保存先決定 (動画と同じフォルダ)
+        base_dir = os.path.dirname(self.video_filepath) if self.video_filepath else get_base_dir()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        out_name = f"crop_{timestamp}.png"
+        out_path = os.path.join(base_dir, out_name)
+
+        # 保存
+        try:
+            if imwrite_jp(out_path, cropped):
+                messagebox.showinfo("Success", f"保存しました:\n{out_name}")
+            else:
+                messagebox.showerror("Error", "保存に失敗しました。")
+        except Exception as e:
+            messagebox.showerror("Error", f"例外が発生しました:\n{e}")
 
     def hhmmss_to_sec(self, time_str):
         result = hhmmss_to_sec(time_str)
@@ -1031,7 +1052,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.set_current_time_direct(self.start_time)
         if not self.playing:
             self.playing = True
-            self.btn_play.config(text="停止")
+            self._update_play_button_state()
             self.play_step()
 
     # ------------------ クロップの Undo/Redo ------------------
@@ -1090,34 +1111,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
     # ------------------ ツールチップ ------------------
     def add_tooltip(self, widget, text):
-        # フォーカスやホバー時にツールチップを表示する
-        def show(e=None):
-            try:
-                if getattr(widget, '_tooltip_win', None):
-                    return
-                x = widget.winfo_rootx() + 20
-                y = widget.winfo_rooty() + 20
-                tw = tk.Toplevel(widget)
-                tw.wm_overrideredirect(True)
-                tw.wm_geometry(f"+{x}+{y}")
-                lbl = tk.Label(tw, text=text, background="#ffffe0", relief='solid', borderwidth=1)
-                lbl.pack()
-                widget._tooltip_win = tw
-            except Exception:
-                pass
-
-        def hide(e=None):
-            try:
-                if getattr(widget, '_tooltip_win', None):
-                    widget._tooltip_win.destroy()
-                    widget._tooltip_win = None
-            except Exception:
-                pass
-
-        widget.bind('<FocusIn>', show)
-        widget.bind('<FocusOut>', hide)
-        widget.bind('<Enter>', show)
-        widget.bind('<Leave>', hide)
+        """フォーカスやホバー時にツールチップを表示する."""
+        _add_tooltip(widget, text)
 
     def _scaled_rect_from_crop(self):
         # crop_rect (base coords) -> scaled coords on canvas
@@ -1151,6 +1146,17 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             self.draw_seekbar()
         except Exception:
             pass
+
+    # ------------------ ヘルパー: 時間変換 (utils モジュールに委譲) ------------------
+    def sec_to_display(self, sec):
+        return sec_to_display(sec)
+
+    def sec_to_hhmmss(self, sec):
+        return sec_to_hhmmss(sec)
+
+    def format_time(self, seconds: float) -> str:
+        """秒数を時:分:秒の形式にフォーマットする."""
+        return sec_to_display(seconds)
 
     # ------------------ 比率ヘルパー (utils モジュールに委譲) ------------------
     def _ratio_value_from_str(self, rstr):
@@ -1234,8 +1240,9 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         except Exception:
             alt_held = False
         if alt_held and getattr(self, 'rect_focused', False) and self._arrow_dir in (-1, 1):
-            # move crop horizontally by 1px per step (no fractional)
-            dx = -1 if self._arrow_dir == -1 else 1
+            # move crop horizontally by 1px or 10px per step
+            base_dx = -1 if self._arrow_dir == -1 else 1
+            dx = base_dx * 10 if ctrl else base_dx
             self.move_crop_by(dx, 0)
             return
         if self._arrow_dir == -1:
@@ -1252,13 +1259,15 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         if self.frame is None:
             return
         # compute video pixel crop
-        x1, y1, x2, y2 = self.crop_rect
+        vx1, vy1, vx2, vy2 = [int(v) for v in self.crop_rect]
         vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        sx = vid_w / self.CANVAS_W
-        sy = vid_h / self.CANVAS_H
-        vx1, vy1 = int(x1 * sx), int(y1 * sy)
-        vx2, vy2 = int(x2 * sx), int(y2 * sy)
+        
+        # 安全のためクランプ
+        vx1 = max(0, min(vid_w, vx1))
+        vy1 = max(0, min(vid_h, vy1))
+        vx2 = max(0, min(vid_w, vx2))
+        vy2 = max(0, min(vid_h, vy2))
         ret, frm = True, self.frame
         try:
             crop = frm[vy1:vy2, vx1:vx2]
@@ -1291,6 +1300,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
         # EXE化時のリソースパス解決用ヘルパー
         def resource_path(relative_path):
+            import sys
             if hasattr(sys, '_MEIPASS'):
                 return os.path.join(sys._MEIPASS, relative_path)
             return os.path.join(os.path.abspath("."), relative_path)
@@ -1305,24 +1315,38 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             except Exception:
                 text = ''
         if not text:
-            text = 'Ctrl+Z: 戻す\nCtrl+C: クロップをクリップボードへコピー\nSpace: 再生/停止\n区間再生: start->end を再生\nループ再生: 末尾到達で先頭に戻る'
+            text = 'Ctrl+Z: 戻す\nCtrl+C: クロップをクリップボードへコピー\nSpace: 再生/停止\nHome/End: トリム範囲の先頭/末尾にジャンプ\nCtrl+Home/End: 動画の先頭/末尾にジャンプ\nAlt+矢印: 1px移動 / Alt+Ctrl+矢印: 10px移動\nShift+矢印: 1px拡縮 / Shift+Ctrl+矢印: 10px拡縮\nShift+左ドラッグ: 垂直/水平移動に限定'
 
         # show in simple Toplevel with scrollable Text
         top = tk.Toplevel(self.root)
         top.title('ショートカット一覧')
         self._shortcuts_win = top
+
         def _on_close():
             try:
                 self._shortcuts_win.destroy()
             except Exception:
                 pass
             self._shortcuts_win = None
+
         top.protocol('WM_DELETE_WINDOW', _on_close)
         txt = tk.Text(top, wrap='word', width=60, height=15)
         txt.insert('1.0', text)
         txt.config(state=tk.DISABLED)
         txt.pack(fill=tk.BOTH, expand=True)
         tk.Button(top, text='閉じる', command=_on_close).pack(pady=4)
+
+        # 親ウィンドウの中央に表示
+        top.update_idletasks()
+        w = top.winfo_width()
+        h = top.winfo_height()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        tx = rx + (rw // 2) - (w // 2)
+        ty = ry + (rh // 2) - (h // 2)
+        top.geometry(f"+{tx}+{ty}")
 
     def update_crop_entries(self):
         """クロップ矩形からサイズ入力フィールドを更新"""
@@ -1348,7 +1372,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         """解像度設定とマウスによるリサイズをロック/解除する"""
         is_locked = not self.lock_var.get()
         self.lock_var.set(is_locked)
-        self.btn_lock_res.config(text="🔒" if is_locked else "🔓", bg="#ffcccc" if is_locked else "#ccffcc")
+        self.btn_lock_res.config(text="🔒" if is_locked else "🔓", 
+                                 bg=self.theme.get("button_locked_bg") if is_locked else self.theme.get("button_unlocked_bg"))
         
         state = tk.DISABLED if is_locked else tk.NORMAL
         self.ratio_optionmenu.config(state=state)
@@ -1359,12 +1384,16 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.btn_redo.config(state=state if self.crop_redo else tk.DISABLED)
         self.btn_save_preset.config(state=state)
         self.btn_delete_preset.config(state=state)
+        
+        # ハンドルの表示・非表示を即座に反映
+        self.update_canvas_image()
 
     def toggle_move_lock(self):
         """座標設定とマウスによる移動をロック/解除する"""
         is_locked = not self.lock_move_var.get()
         self.lock_move_var.set(is_locked)
-        self.btn_lock_move.config(text="🔒" if is_locked else "🔓", bg="#ffcccc" if is_locked else "#ccffcc")
+        self.btn_lock_move.config(text="🔒" if is_locked else "🔓", 
+                                  bg=self.theme.get("button_locked_bg") if is_locked else self.theme.get("button_unlocked_bg"))
         
         state = tk.DISABLED if is_locked else tk.NORMAL
         self.entry_crop_x.config(state=state)
@@ -1544,157 +1573,20 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.load_video(target_path=result_path)
 
     def load_video(self, target_path=None):
-        """Load video file.
-        
-        Args:
-            target_path: 指定がある場合はそのパスを開く。Noneの場合はダイアログを表示。
-        """
+        """動画ファイルを選択して読み込む"""
+        file_path = target_path
+        if not file_path:
+            file_path = filedialog.askopenfilename(
+                filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv"), ("All files", "*.*")])
+        if file_path:
+            self._load_video_internal(file_path)
         if self.playing:
             self.toggle_play()
 
-        if target_path:
-            path = target_path
-        else:
-            path = filedialog.askopenfilename(filetypes=[
-                ("動画ファイル", ("*.mp4", "*.mkv", "*.mov", "*.avi")),
-                ("MP4", "*.mp4"),
-                ("MKV", "*.mkv"),
-                ("MOV", "*.mov"),
-                ("AVI", "*.avi"),
-                ("すべてのファイル", "*.*")
-            ])
-        
-        if not path:
-            return
-
-        self.cap = cv2.VideoCapture(path)
-        if not self.cap.isOpened():
-            messagebox.showerror("Error", "動画を読み込めませんでした")
-            return
-
-        # ファイル名から拡張子を除いた名前とフルパスを保存
-        self.video_filename = os.path.splitext(os.path.basename(path))[0]
-        self.video_filepath = os.path.abspath(path)
-        # ズーム/パン状態をリセット
-        try:
-            self.image_zoom = 1.0
-            self.pan_offset_x = 0
-            self.pan_offset_y = 0
-        except Exception:
-            pass
-
-        # 動画を開いた時点で、最後に開いた動画のパスを設定に書き込む
-        try:
-            self.save_config()
-        except Exception:
-            pass
-
-        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
-        frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        self.duration = max(0, int(round(frames / self.fps))
-                            ) if self.fps > 0 else 0
-
-        # default times
-        self.start_time = 0
-        self.end_time = self.duration
-        self.current_time = 0
-
-        # Try to load per-video settings if present; otherwise fall back to global config
-        try:
-            settings_path = os.path.splitext(path)[0] + '.settings.json'
-            per_video = None
-            if os.path.exists(settings_path):
-                with open(settings_path, 'r', encoding='utf-8') as sf:
-                    per_video = json.load(sf)
-            if per_video:
-                crop_rect = per_video.get('crop_rect', {})
-                self.start_time = per_video.get('start_time', self.start_time)
-                self.end_time = per_video.get('end_time', self.end_time)
-                if crop_rect:
-                    self.crop_rect = [
-                        crop_rect.get('x1', 100),
-                        crop_rect.get('y1', 80),
-                        crop_rect.get('x2', 300),
-                        crop_rect.get('y2', 250),
-                    ]
-            else:
-                # fallback to global config if present
-                try:
-                    cfg_path = os.path.join(get_base_dir(), CONFIG_FILENAME)
-                    if os.path.exists(cfg_path):
-                        with open(cfg_path, 'r', encoding='utf-8') as cf:
-                            cfg = json.load(cf)
-                            crop_rect = cfg.get('crop_rect', {})
-                            self.start_time = cfg.get('start_time', self.start_time)
-                            self.end_time = cfg.get('end_time', self.end_time)
-                            if crop_rect:
-                                self.crop_rect = [
-                                    crop_rect.get('x1', 100),
-                                    crop_rect.get('y1', 80),
-                                    crop_rect.get('x2', 300),
-                                    crop_rect.get('y2', 250),
-                                ]
-                except Exception:
-                    # last-resort: center default rectangle
-                    pass
-
-        except Exception:
-            # Prepare a centered default crop if any read fails
-            cw, ch = self.CANVAS_W // 3, self.CANVAS_H // 3
-            cx = (self.CANVAS_W - cw) // 2
-            cy = (self.CANVAS_H - ch) // 2
-            self.crop_rect = self.clamp_rect_canvas([cx, cy, cx+cw, cy+ch])
-        else:
-            # ensure crop rect is clamped to canvas
-            try:
-                self.crop_rect = self.clamp_rect_canvas(self.crop_rect)
-            except Exception:
-                cw, ch = self.CANVAS_W // 3, self.CANVAS_H // 3
-                cx = (self.CANVAS_W - cw) // 2
-                cy = (self.CANVAS_H - ch) // 2
-                self.crop_rect = self.clamp_rect_canvas([cx, cy, cx+cw, cy+ch])
-        try:
-            scaled = self._scaled_rect_from_crop()
-            self.canvas.coords(self.rect_id, *scaled)
-            self._update_corner_handles(self._get_corner_coords(scaled))
-        except Exception:
-            self.canvas.coords(self.rect_id, *self.crop_rect)
-
-        try:
-            self.entry_fullpath_var.set(os.path.abspath(path))
-        except Exception:
-            pass
-        try:
-            self.label_seconds.config(text=f"({self.duration}s)")
-        except Exception:
-            pass
-
-        self.show_frame_at(0)
-        self.update_ui_texts()
-        self.update_crop_entries()
-        try:
-            self.draw_seekbar()
-        except Exception:
-            pass
-
-        # Clear undo/redo memory when switching video
-        try:
-            self.crop_history = []
-            self.crop_redo = []
-            try:
-                self.btn_undo.config(state=tk.DISABLED)
-            except Exception:
-                pass
-            try:
-                self.btn_redo.config(state=tk.DISABLED)
-            except Exception:
-                pass
-        except Exception:
-            pass
 
     def toggle_play(self):
         self.playing = not self.playing
-        self.btn_play.config(text="■停止" if self.playing else "▲再生")
+        self._update_play_button_state()
         if self.playing:
             # 区間再生チェックが有効なら再生前に位置を範囲内に移動
             try:
@@ -1734,6 +1626,16 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                 self.root.after_cancel(self._play_after_id)
                 self._play_after_id = None
 
+    def _update_play_button_state(self):
+        """再生/停止ボタンの表示テキストと背景色を更新する"""
+        if self.playing:
+            text = "■ 停止"
+            bg = self.theme.get("button_stop_bg", "#EF9A9A")
+        else:
+            text = "▲ 再生 (Space)"
+            bg = self.theme.get("button_play_bg", "#A5D6A7")
+        self.btn_play.config(text=text, bg=bg)
+
     def play_step(self):
         if not (self.cap and self.playing):
             return
@@ -1770,7 +1672,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                         self.current_time = float(self.end_time)
                         self.playing = False
                         self.play_range_mode = False
-                        self.btn_play.config(text="▲再生")
+                        self.btn_play.config(text="▲ 再生 (Space)")
+                        self._update_play_button_state()
             else:
                 # 通常再生: 末尾到達時はループ設定で先頭へ戻す
                 loop_on = getattr(self, 'loop_var', None) is not None and self.loop_var.get()
@@ -1788,7 +1691,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                     else:
                         self.current_time = float(self.duration)
                         self.playing = False
-                        self.btn_play.config(text="▲再生")
+                        self.btn_play.config(text="▲ 再生 (Space)")
+                        self._update_play_button_state()
         else:
             # 逆再生時
             if getattr(self, 'play_range_mode', False):
@@ -1808,7 +1712,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                         self.current_time = float(self.start_time)
                         self.playing = False
                         self.play_range_mode = False
-                        self.btn_play.config(text="▲再生(Space)")
+                        self.btn_play.config(text="▲ 再生 (Space)")
+                        self._update_play_button_state()
             else:
                 loop_on = getattr(self, 'loop_var', None) is not None and self.loop_var.get()
                 if self.current_time <= 0:
@@ -1825,7 +1730,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                     else:
                         self.current_time = 0.0
                         self.playing = False
-                        self.btn_play.config(text="▲再生(Space)")
+                        self.btn_play.config(text="▲ 再生 (Space)")
+                        self._update_play_button_state()
 
         self.update_ui_texts()  # This updates texts and seekbar
 
@@ -1893,9 +1799,14 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.canvas.itemconfig(self.canvas_image, image=self.tk_img)
         self.canvas.coords(self.canvas_image, offset_x, offset_y)
 
-        # スケール比を計算（元の座標系から表示上への変換）
-        self.canvas_scale_x = rw / self.CANVAS_W
-        self.canvas_scale_y = rh / self.CANVAS_H
+        # スケール比を計算（元の動画座標系から表示上への変換）
+        self.canvas_scale_x = rw / self.vid_w if self.vid_w > 0 else 1.0
+        self.canvas_scale_y = rh / self.vid_h if self.vid_h > 0 else 1.0
+
+        # 表示倍率（ズーム率）を更新
+        if hasattr(self, 'label_zoom'):
+            zoom_pct = int(round(self.canvas_scale_x * 100))
+            self.label_zoom.config(text=f"{zoom_pct}%")
 
         # crop_rectをスケールして描画
         scaled_rect = [
@@ -1906,29 +1817,62 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         ]
         self.canvas.coords(self.rect_id, *scaled_rect)
 
-        # ズーム/スケールに合わせて矩形枠線幅を調整（動画解像度における2ドット分の太さを再現）
+        # 矩形の外見(色、太さ、線種)を更新
         try:
+            # テーマ設定の取得
+            base_width = self.theme.get("crop_width")
+            
+            # 状態の判定
+            is_active = getattr(self, 'rect_focused', False)
+            is_dragging_or_resizing = self.dragging_rect or self.resizing_rect
+            
             # 動画ピクセルからキャンバス表示ピクセルへのトータルスケールを計算
-            total_scale_x = rw / frame_w if frame_w > 0 else 1.0
-            total_scale_y = rh / frame_h if frame_h > 0 else 1.0
-            avg_total_scale = (total_scale_x + total_scale_y) / 2.0
-            # 元の動画の2ドット分を表示上の太さにする（最低1ドットは維持）
-            line_w = max(1, int(round(2 * avg_total_scale)))
-            self.canvas.itemconfig(self.rect_id, width=line_w)
+            total_scale = (rw / frame_w + rh / frame_h) / 2.0 if frame_w > 0 and frame_h > 0 else 1.0
+            
+            # 優先順位: 1.Focused (選択中/操作中) 2.Hover 3.Default
+            if is_active or is_dragging_or_resizing:
+                # 選択中または操作中 (既定: 赤色の実線)
+                width = max(1, int(round((base_width + 1) * total_scale)))
+                linecolor = self.theme.get("crop_focused_linecolor")
+                linestyle = self.theme.get("crop_focused_linestyle")
+            elif self.rect_hovered:
+                # ホバー中（操作していない時、かつ未選択時。既定: 赤色の破線）
+                width = max(1, int(round((base_width + 1) * total_scale)))
+                linecolor = self.theme.get("crop_hover_linecolor")
+                linestyle = self.theme.get("crop_hover_linestyle")
+            else:
+                # デフォルト（未選択・非ホバー。既定: 橙色の破線）
+                width = max(1, int(round(base_width * total_scale)))
+                linecolor = self.theme.get("crop_default_linecolor")
+                linestyle = self.theme.get("crop_default_linestyle")
+
+            # linestyle が空文字列やNoneの場合は実線、タプルやリストの場合は破線にする
+            if not linestyle or linestyle == "":
+                linestyle_arg = ""
+            else:
+                # tkinter の破線引数として適切な形式に変換
+                linestyle_arg = tuple(linestyle) if isinstance(linestyle, (list, tuple)) else linestyle
+
+            self.canvas.itemconfig(self.rect_id, width=width, outline=linecolor, dash=linestyle_arg)
         except Exception:
             pass
 
         # 角マーカー（ハンドル）を描画/更新する
         self._update_corner_handles(self._get_corner_coords(scaled_rect))
+        
+        # マウス軌跡のオーバーレイ描画
+        self.update_canvas_overlay()
 
     # ------------------ キャンバスリサイズ処理 ------------------
-    def on_canvas_resize(self, event):
+    def on_canvas_resize(self, event=None):
         """キャンバスのリサイズイベントを処理"""
-        if event.width > 0 and event.height > 0:
-            # スケール比を計算（デフォルトサイズに対する比率）
-            # 高さは最小値を保証して計算の安定を図る
-            h_eff = max(event.height, getattr(self, 'CANVAS_MIN_H', event.height))
-            self.canvas_scale_x = event.width / self.CANVAS_W
+        cw = event.width if event else self.canvas.winfo_width()
+        ch = event.height if event else self.canvas.winfo_height()
+        
+        if cw > 1 and ch > 1:
+            # スケール比を計算
+            h_eff = max(ch, getattr(self, 'CANVAS_MIN_H', ch))
+            self.canvas_scale_x = cw / self.CANVAS_W
             self.canvas_scale_y = h_eff / self.CANVAS_H
             # フレームを再描画
             if self.frame is not None:
@@ -1937,14 +1881,23 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             self.update_ui_texts()
 
     def _update_corner_handles(self, corners: list[tuple[int, int, int, int]]) -> None:
-        """コーナーハンドルの矩形を更新（存在しなければ作成）."""
+        """コーナーハンドルの矩形を更新(存在しなければ作成)."""
         if not hasattr(self, 'corner_ids'):
             self.corner_ids = [None, None, None, None]
+        
+        # リサイズロック時は非表示にする
+        lock_res = self.lock_var.get()
+        state = tk.HIDDEN if lock_res else tk.NORMAL
+        
+        # デフォルトのハンドルの色（通常時: 白）
+        handle_color = "#FFFFFF"
+        
         for i, rect in enumerate(corners):
             if self.corner_ids[i] is None:
-                self.corner_ids[i] = self.canvas.create_rectangle(*rect, fill='red')
+                self.corner_ids[i] = self.canvas.create_rectangle(*rect, fill=handle_color, outline="black", width=1, state=state)
             else:
                 self.canvas.coords(self.corner_ids[i], *rect)
+                self.canvas.itemconfig(self.corner_ids[i], fill=handle_color, state=state)
 
     def _get_corner_coords(self, scaled_rect: list[int]) -> list[tuple[int, int, int, int]]:
         """スケール後の矩形座標から4隅のハンドル矩形座標を計算."""
@@ -1960,10 +1913,66 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
     def _sync_crop_rect_ui(self) -> None:
         """クロップ矩形をキャンバスに反映し、ハンドルとエントリを更新."""
-        scaled_rect = self._scaled_rect_from_crop()
-        self.canvas.coords(self.rect_id, *scaled_rect)
-        self._update_corner_handles(self._get_corner_coords(scaled_rect))
+        if self.frame is not None:
+            self.update_canvas_image()
+        else:
+            scaled_rect = self._scaled_rect_from_crop()
+            self.canvas.coords(self.rect_id, *scaled_rect)
+            self._update_corner_handles(self._get_corner_coords(scaled_rect))
         self.update_crop_entries()
+
+    def load_trajectory(self):
+        """動画と同名の .tsv からマウス軌跡データを読み込む."""
+        self.trajectory_data = []
+        if not self.video_filepath:
+            return
+        
+        tsv_path = os.path.splitext(self.video_filepath)[0] + ".tsv"
+        if os.path.exists(tsv_path):
+            try:
+                with open(tsv_path, "r", encoding="utf-8") as f:
+                    # ヘッダーをスキップ
+                    next(f, None)
+                    for line in f:
+                        parts = line.strip().split("\t")
+                        if len(parts) >= 4:
+                            # timestamp, frame, x, y
+                            try:
+                                t = float(parts[0])
+                                x = int(parts[2])
+                                y = int(parts[3])
+                                self.trajectory_data.append((t, x, y))
+                            except:
+                                pass
+            except Exception as e:
+                print(f"TSV読込エラー: {e}")
+
+    def update_canvas_overlay(self):
+        """マウス軌跡等のオーバーレイを表示中のフレームに合わせて描画."""
+        self.canvas.delete("overlay")
+        if not self.show_trajectory_var.get() or not self.trajectory_data:
+            return
+
+        # 現在の時刻に近いデータを検索
+        relevant_data = None
+        for t, x, y in self.trajectory_data:
+            if abs(t - self.current_time) < (1.0 / self.fps): # 1フレーム以内
+                relevant_data = (x, y)
+                break
+        
+        if relevant_data:
+            x, y = relevant_data
+            try:
+                cx = x * self.canvas_scale_x + self.canvas_offset_x
+                cy = y * self.canvas_scale_y + self.canvas_offset_y
+                
+                # ポインタを描画 (赤丸)
+                r = 6
+                self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r, outline="red", width=2, tags="overlay")
+                # 中心点
+                self.canvas.create_oval(cx-2, cy-2, cx+2, cy+2, fill="red", tags="overlay")
+            except:
+                pass
 
     # ------------------ シークバーとマーカー ------------------
     def get_x(self, t):
@@ -2071,7 +2080,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
     # クロップ矩形のマウス操作は CropHandlerMixin のメソッドを使用します
 
     def on_mouse_down(self, e):
-        edges = self.near_edge(e.x, e.y)
+        edges = self.near_edge(e.x, e.y, m=self.EDGE_MARGIN)
         if any(edges.values()):
             if self.lock_var.get():
                 # ロック中はリサイズ不可だが、内側ならドラッグ開始（移動のみ許可）
@@ -2093,7 +2102,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                 self.orig_aspect_ratio = w / h if h > 0 else 1.0
             self.rect_focused = True
             try:
-                self.canvas.itemconfig(self.rect_id, outline='orange')
+                self.update_canvas_image()
             except Exception:
                 pass
         elif self.inside_rect(e.x, e.y):
@@ -2106,7 +2115,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             if getattr(self, 'rect_focused', False):
                 self.rect_focused = False
                 try:
-                    self.canvas.itemconfig(self.rect_id, outline='red')
+                    self.update_canvas_image()
                 except Exception:
                     pass
 
@@ -2116,10 +2125,12 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         except Exception:
             pass
         img_x, img_y = self.canvas_mouse_to_image_coords(e.x, e.y)
+        # ドラッグ開始時の左上座標を保存（軸固定移動用）
+        self.drag_start_rect = self.crop_rect.copy()
         self.drag_offset = (img_x - self.crop_rect[0], img_y - self.crop_rect[1])
         self.rect_focused = True
         try:
-            self.canvas.itemconfig(self.rect_id, outline='orange')
+            self.update_canvas_image()
         except Exception:
             pass
 
@@ -2127,51 +2138,65 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
     def on_mouse_drag(self, e):
         if self.resizing_rect:
             # マウス座標を画像座標に変換
-            img_x, img_y = self.canvas_mouse_to_image_coords(e.x, e.y)
+            ix, iy = self.canvas_mouse_to_image_coords(e.x, e.y)
+            img_x, img_y = int(round(ix)), int(round(iy))
+
+            # Ctrl キー (0x4), Shift キー (0x1), Alt キー (Windows: 0x20000 | 0x8)
+            try:
+                ctrl_held = (e.state & 0x4) != 0
+                shift_held = (e.state & 0x1) != 0
+                alt_held = (e.state & (0x20000 | 0x8)) != 0
+            except Exception:
+                ctrl_held = False
+                shift_held = False
+                alt_held = False
 
             x1, y1, x2, y2 = self.orig_rect
             
-            # Ctrl キー押下時の対称リサイズ判定
-            try:
-                ctrl_held = (e.state & 0x4) != 0
-            except Exception:
-                ctrl_held = False
-
             if ctrl_held:
                 # 対称リサイズ: 反対側も同じ分だけ動かす
-                if self.resize_edge["l"]:
-                    dx = img_x - x1
-                    x1 = img_x
-                    x2 = x2 - dx
-                elif self.resize_edge["r"]:
-                    dx = img_x - x2
-                    x2 = img_x
-                    x1 = x1 - dx
+                if self.resize_edge["l"] or self.resize_edge["r"]:
+                    cx = (x1 + x2) / 2
+                    if alt_held:
+                        w = round(abs(img_x - cx) * 2 / 10) * 10
+                    else:
+                        w = abs(img_x - cx) * 2
+                    x1 = cx - w/2
+                    x2 = cx + w/2
                 
-                if self.resize_edge["t"]:
-                    dy = img_y - y1
-                    y1 = img_y
-                    y2 = y2 - dy
-                elif self.resize_edge["b"]:
-                    dy = img_y - y2
-                    y2 = img_y
-                    y1 = y1 - dy
+                if self.resize_edge["t"] or self.resize_edge["b"]:
+                    cy = (y1 + y2) / 2
+                    if alt_held:
+                        h = round(abs(img_y - cy) * 2 / 10) * 10
+                    else:
+                        h = abs(img_y - cy) * 2
+                    y1 = cy - h/2
+                    y2 = cy + h/2
             else:
                 # 通常のリサイズ
                 if self.resize_edge["l"]:
-                    x1 = img_x
+                    if alt_held:
+                        x1 = x2 - round((x2 - img_x) / 10) * 10
+                    else:
+                        x1 = img_x
                 if self.resize_edge["r"]:
-                    x2 = img_x
+                    if alt_held:
+                        x2 = x1 + round((img_x - x1) / 10) * 10
+                    else:
+                        x2 = img_x
                 if self.resize_edge["t"]:
-                    y1 = img_y
+                    if alt_held:
+                        y1 = y2 - round((y2 - img_y) / 10) * 10
+                    else:
+                        y1 = img_y
                 if self.resize_edge["b"]:
-                    y2 = img_y
+                    if alt_held:
+                        y2 = y1 + round((img_y - y1) / 10) * 10
+                    else:
+                        y2 = img_y
 
             # Shift キー押下時のアスペクト比ロック
-            try:
-                self.maintain_aspect_ratio = (e.state & 0x1) != 0
-            except Exception:
-                pass
+            self.maintain_aspect_ratio = shift_held
             if self.maintain_aspect_ratio:
                 x1, y1, x2, y2 = self.maintain_aspect_ratio_resize(
                     x1, y1, x2, y2, ctrl_held=ctrl_held)
@@ -2190,22 +2215,48 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                 self.canvas_offset_y
             ]
             self.canvas.coords(self.rect_id, *scaled_rect)
-            # 矩形のフォーカス色を維持
-            try:
-                self.canvas.itemconfig(self.rect_id, outline='orange' if self.rect_focused else 'red')
-            except Exception:
-                pass
+            # 矩形の外見をテーマに合わせて更新
+            self.update_canvas_image()
             # update corner handles
             self._update_corner_handles(self._get_corner_coords(scaled_rect))
             self.update_crop_entries()
         elif self.dragging_rect:
             # マウス座標を画像座標に変換
-            img_x, img_y = self.canvas_mouse_to_image_coords(e.x, e.y)
+            ix, iy = self.canvas_mouse_to_image_coords(e.x, e.y)
+            img_x, img_y = int(round(ix)), int(round(iy))
+
+            # 修飾キー判定 (Shift: 0x1, Alt: 0x20000 | 0x8)
+            try:
+                shift_held = (e.state & 0x1) != 0
+                alt_held = (e.state & (0x20000 | 0x8)) != 0
+            except Exception:
+                shift_held = False
+                alt_held = False
 
             w = self.crop_rect[2] - self.crop_rect[0]
             h = self.crop_rect[3] - self.crop_rect[1]
-            nx = img_x - self.drag_offset[0]
-            ny = img_y - self.drag_offset[1]
+            
+            # マウス位置に基づいた生の移動先候補
+            raw_nx = img_x - self.drag_offset[0]
+            raw_ny = img_y - self.drag_offset[1]
+
+            # Shift押下時は軸固定（水平または垂直の移動量が大きい方を優先）
+            if shift_held and hasattr(self, 'drag_start_rect'):
+                sx, sy = self.drag_start_rect[0], self.drag_start_rect[1]
+                dx = raw_nx - sx
+                dy = raw_ny - sy
+                if abs(dx) > abs(dy):
+                    nx, ny = raw_nx, sy
+                else:
+                    nx, ny = sx, raw_ny
+            else:
+                nx, ny = raw_nx, raw_ny
+
+            # Alt押下時は10px単位にスナップ
+            if alt_held:
+                nx = round(nx / 10) * 10
+                ny = round(ny / 10) * 10
+                
             self.crop_rect = self.clamp_rect_canvas([nx, ny, nx+w, ny+h])
 
             # スケール後の座標で矩形を描画
@@ -2222,14 +2273,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             self.canvas.coords(self.rect_id, *scaled_rect)
             self._update_corner_handles(self._get_corner_coords(scaled_rect))
             self.update_crop_entries()
-            try:
-                self.canvas.itemconfig(self.rect_id, outline='orange' if self.rect_focused else 'red')
-            except Exception:
-                pass
-            try:
-                self.canvas.itemconfig(self.rect_id, outline='orange' if self.rect_focused else 'red')
-            except Exception:
-                pass
+            # 矩形の外見をテーマに合わせて更新
+            self.update_canvas_image()
 
     def on_mouse_up(self, e):
         self.dragging_rect = False
@@ -2239,10 +2284,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             self.maintain_aspect_ratio = False
         except Exception:
             pass
-        try:
-            self.canvas.itemconfig(self.rect_id, outline='orange' if self.rect_focused else 'red')
-        except Exception:
-            pass
+        # 矩形の外見をテーマに合わせて更新
+        self.update_canvas_image()
 
     def on_right_mouse_down(self, e):
         # 右クリックで矩形を移動開始（リサイズは行わない）
@@ -2260,7 +2303,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             # フォーカスを与える
             self.rect_focused = True
             try:
-                self.canvas.itemconfig(self.rect_id, outline='orange')
+                self.update_canvas_image()
             except Exception:
                 pass
 
@@ -2332,11 +2375,37 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                     delta = 0
             if delta == 0:
                 return
-            step = 0.1
+                
+            current_zoom = getattr(self, 'image_zoom', 1.0)
+            # 安全のためゼロ以下除外
+            if current_zoom <= 0.001:
+                current_zoom = 0.1
+
+            # 現在のズームレベルを計算 (base 1.1)
+            try:
+                current_level = round(math.log(current_zoom, 1.1))
+            except Exception:
+                current_level = 0
+            
             if delta > 0:
-                self.image_zoom = min(10.0, getattr(self, 'image_zoom', 1.0) * (1.0 + step))
+                new_level = current_level + 1
             else:
-                self.image_zoom = max(0.1, getattr(self, 'image_zoom', 1.0) * (1.0 - step))
+                new_level = current_level - 1
+            
+            # レベル0は正確に1.0にする
+            if new_level == 0:
+                new_zoom = 1.0
+            else:
+                new_zoom = 1.1 ** new_level
+            
+            # キャンバス中央を起点としたズームのためにパンオフセットを調整
+            # ズーム倍率の変化比率をパンオフセットに乗じる
+            zoom_ratio = new_zoom / current_zoom
+            self.pan_offset_x = getattr(self, 'pan_offset_x', 0) * zoom_ratio
+            self.pan_offset_y = getattr(self, 'pan_offset_y', 0) * zoom_ratio
+
+            self.image_zoom = max(0.1, min(10.0, new_zoom))
+
             if self.frame is not None:
                 self.update_canvas_image()
         except Exception:
@@ -2344,8 +2413,15 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
     def on_canvas_motion(self, e):
         # マウス移動時にカーソルを変更し、ハンドルをハイライトする
-        # 角優先で判定
-        edges = self.near_edge(e.x, e.y, m=10)
+        edges = self.near_edge(e.x, e.y, m=10)  # ハイライト用は小さめの判定
+        inside = self.inside_rect(e.x, e.y)
+        
+        # ホバー状態の更新
+        was_hovered = self.rect_hovered
+        self.rect_hovered = inside or any(edges.values())
+        if was_hovered != self.rect_hovered:
+            self.update_canvas_image()
+
         res_lock = self.lock_var.get()
         move_lock = self.lock_move_var.get()
         cursor = ""
@@ -2375,9 +2451,12 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         except Exception:
             pass
 
-        # ハンドルのハイライト
+            # ハンドルのハイライト
         if hasattr(self, 'corner_ids'):
-            # determine which corner (if any)
+            # クロップ範囲全体のホバー状態
+            crop_hovered = self.rect_hovered
+            
+            # どの角がホバーされているか特定
             highlight_idx = None
             if edges.get('l') and edges.get('t'):
                 highlight_idx = 0
@@ -2387,329 +2466,26 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                 highlight_idx = 2
             elif edges.get('r') and edges.get('b'):
                 highlight_idx = 3
+
             for i, cid in enumerate(self.corner_ids):
                 if cid is None:
                     continue
-                color = 'yellow' if i == highlight_idx else 'red'
+                
+                # 色の決定
+                # 1. 特定の角をホバー時 -> その角だけ赤
+                # 2. クロップ範囲ホバー時 -> 全点黄色
+                # 3. それ以外 -> 白
+                if i == highlight_idx:
+                    color = 'red'
+                elif crop_hovered:
+                    color = 'yellow'
+                else:
+                    color = 'white'
+                
                 try:
                     self.canvas.itemconfig(cid, fill=color)
                 except Exception:
                     pass
-
-    # ------------------ 出力処理 ------------------
-    def open_folder(self, path):
-        """プラットフォーム依存でフォルダを開く"""
-        try:
-            if os.name == 'nt':
-                os.startfile(path)
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['open', path])
-            else:
-                # Linux 等
-                subprocess.Popen(['xdg-open', path])
-        except Exception as e:
-            messagebox.showerror("Error", f"フォルダを開けませんでした:\n{e}")
-
-    def open_video_settings(self):
-        """当該動画に紐づく設定ファイルを既定のプログラムで開く"""
-        if not self.video_filepath:
-            messagebox.showinfo("Info", "設定ファイルを開く対象の動画が選択されていません")
-            return
-        settings_path = os.path.splitext(self.video_filepath)[0] + '.settings.json'
-        if not os.path.exists(settings_path):
-            messagebox.showinfo("Info", f"設定ファイルが見つかりません:\n{settings_path}")
-            return
-        try:
-            if os.name == 'nt':
-                os.startfile(settings_path)
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['open', settings_path])
-            else:
-                subprocess.Popen(['xdg-open', settings_path])
-        except Exception as e:
-            messagebox.showerror('Error', f'設定ファイルを開けませんでした:\n{e}')
-
-    def export_png(self):
-        if not self.cap:
-            messagebox.showerror("Error", "動画なし")
-            return
-        video_name = os.path.basename(self.video_filepath) if self.video_filepath else None
-        video_dir = os.path.dirname(self.video_filepath) if self.video_filepath else None
-        base_dir = filedialog.askdirectory(initialdir=video_dir)
-        if not base_dir:
-            return
-
-        # 実行日時のフォルダを作成
-        now = time.strftime("%Y%m%d_%H%M%S")
-        save_dir = os.path.join(base_dir, f"{video_name}_crops_{now}")
-        os.makedirs(save_dir, exist_ok=True)
-
-        # PNG圧縮レベルを設定
-        save_params = [int(cv2.IMWRITE_PNG_COMPRESSION), self.png_compression]
-
-        # 座標変換
-        x1, y1, x2, y2 = self.crop_rect
-        vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        sx = vid_w / self.CANVAS_W
-        sy = vid_h / self.CANVAS_H
-        vx1, vy1 = int(x1*sx), int(y1*sy)
-        vx2, vy2 = int(x2*sx), int(y2*sy)
-
-        was_playing = self.playing
-        self.playing = False
-        if self._play_after_id:
-            self.root.after_cancel(self._play_after_id)
-
-        # Create modal progress dialog
-        try:
-            progress_win = tk.Toplevel(self.root)
-            progress_win.title("PNG 書き出し...")
-            progress_win.transient(self.root)
-            progress_win.attributes("-topmost", True)
-            progress_win.grab_set()
-            progress_win.resizable(False, False)
-            
-            # ウィンドウを一時的に隠してサイズ計算
-            progress_win.withdraw()
-            
-            tk.Label(progress_win, text="PNG を出力中...").pack(padx=20, pady=(15, 5))
-            pb = ttk.Progressbar(progress_win, orient=tk.HORIZONTAL, length=400, mode='determinate')
-            pb.pack(padx=20, pady=(0, 10))
-            prog_label = tk.Label(progress_win, text="0 / 0")
-            prog_label.pack(padx=20, pady=(0, 15))
-            
-            # メインウィンドウの中央に配置
-            progress_win.update_idletasks()
-            win_w = progress_win.winfo_width()
-            win_h = progress_win.winfo_height()
-            root_x = self.root.winfo_x()
-            root_y = self.root.winfo_y()
-            root_w = self.root.winfo_width()
-            root_h = self.root.winfo_height()
-            pos_x = root_x + (root_w // 2) - (win_w // 2)
-            pos_y = root_y + (root_h // 2) - (win_h // 2)
-            progress_win.geometry(f"+{pos_x}+{pos_y}")
-            progress_win.deiconify()
-        except Exception:
-            progress_win = None
-            pb = None
-            prog_label = None
-
-        try:
-            count = 0
-            t = self.start_time
-            limit = self.end_time
-            frame_interval = 1.0 / self.fps
-            # estimate total steps for progressbar
-            try:
-                total_steps = max(0, int((limit - t) / frame_interval) + 1)
-            except Exception:
-                total_steps = 0
-            if pb is not None and total_steps > 0:
-                pb['maximum'] = total_steps
-                try:
-                    prog_label.config(text=f"0 / {total_steps}")
-                except Exception:
-                    pass
-            prev_crop = None
-            next_crop = None
-            last_saved_crop = None
-
-            step_idx = 0
-            while t <= limit:
-                self.cap.set(cv2.CAP_PROP_POS_MSEC, t*1000)
-                ret, frm = self.cap.read()
-                if ret and frm is not None:
-                    crop = frm[vy1:vy2, vx1:vx2]
-                    if crop.size > 0:
-                        # 次のフレームを取得
-                        next_t = t + frame_interval
-                        if next_t <= limit:
-                            self.cap.set(cv2.CAP_PROP_POS_MSEC, next_t*1000)
-                            ret_next, frm_next = self.cap.read()
-                            if ret_next and frm_next is not None:
-                                next_crop = frm_next[vy1:vy2, vx1:vx2]
-                            else:
-                                next_crop = None
-                        else:
-                            next_crop = None
-
-                        # 前のフレーム、現在のフレーム、次のフレームが全て同じかチェック
-                        is_matches_prev_next = False
-                        if self.check_prev_next.get():
-                            # チェック有効時：前後のフレーム比較を行う
-                            if prev_crop is not None and next_crop is not None:
-                                # 差分を計算してグレースケールに変換
-                                diff1 = cv2.cvtColor(cv2.absdiff(
-                                    prev_crop, crop), cv2.COLOR_BGR2GRAY)
-                                diff2 = cv2.cvtColor(cv2.absdiff(
-                                    crop, next_crop), cv2.COLOR_BGR2GRAY)
-                                if (cv2.countNonZero(diff1) == 0 and
-                                        cv2.countNonZero(diff2) == 0):
-                                    is_matches_prev_next = True
-                            elif prev_crop is None and next_crop is not None:
-                                # 最初のフレーム：現在のフレームと次のフレームが同じかチェック
-                                diff2 = cv2.cvtColor(cv2.absdiff(
-                                    crop, next_crop), cv2.COLOR_BGR2GRAY)
-                                if cv2.countNonZero(diff2) == 0:
-                                    is_matches_prev_next = True
-                            elif prev_crop is not None and next_crop is None:
-                                # 最後のフレーム：前のフレームと現在のフレームが同じかチェック
-                                diff1 = cv2.cvtColor(cv2.absdiff(
-                                    prev_crop, crop), cv2.COLOR_BGR2GRAY)
-                                if cv2.countNonZero(diff1) == 0:
-                                    is_matches_prev_next = True
-                        else:
-                            # チェック無効時は常に真（フィルタリングしない）
-                            is_matches_prev_next = True
-
-                        # 直前に出力したフレームとも比較
-                        is_same_as_last_saved = False
-                        if self.check_duplicate.get() and last_saved_crop is not None:
-                            diff_last = cv2.cvtColor(cv2.absdiff(
-                                last_saved_crop, crop), cv2.COLOR_BGR2GRAY)
-                            if cv2.countNonZero(diff_last) == 0:
-                                is_same_as_last_saved = True
-
-                        # チェックボックスの設定に応じて出力判定
-                        if is_matches_prev_next and not is_same_as_last_saved:
-                            time_str = self.sec_to_hhmmss(t)
-                            # 実際の時間に基づいたフレーム番号を計算
-                            frame_in_sec = int((t - int(t)) * self.fps)
-                            filepath = os.path.join(save_dir, f"{self.video_filename}_{time_str}_{frame_in_sec:03d}.png")
-                            # 日本語パス対応の画像保存関数を使用
-                            self.imwrite_jp(filepath, crop, params=save_params)
-                            last_saved_crop = crop.copy()
-                            count += 1
-
-                        prev_crop = crop.copy()
-                t += frame_interval
-                # update progress
-                step_idx += 1
-                if pb is not None:
-                    try:
-                        pb['value'] = step_idx
-                        prog_label.config(text=f"{step_idx} / {total_steps}")
-                        progress_win.update()
-                    except Exception:
-                        pass
-
-            # 設定を保存（プリセットなども含めてマージ保存）
-            try:
-                self.save_config()
-            except Exception:
-                pass
-            
-            # 完了ダイアログの前にウィンドウを消す
-            try:
-                if progress_win is not None:
-                    progress_win.grab_release()
-                    progress_win.destroy()
-                    progress_win = None
-            except Exception:
-                pass
-
-            # 完了ダイアログとフォルダを開くかの確認
-            open_now = messagebox.askyesno("完了", f"{count} images saved.\nフォルダを開きますか？")
-            if open_now:
-                self.open_folder(save_dir)
-        # except Exception as e:
-        #     messagebox.showerror("Err", str(e))
-        finally:
-            # Destroy progress dialog
-            try:
-                if progress_win is not None:
-                    progress_win.grab_release()
-                    progress_win.destroy()
-            except Exception:
-                pass
-            self.playing = was_playing
-            if self.playing:
-                self.play_step()
-
-    def export_video(self):
-        """赤枠範囲をstart時間からend時間まで動画ファイルとして出力"""
-        if not self.cap:
-            messagebox.showerror("Error", "動画なし")
-            return
-        
-        # 保存先とファイル名をユーザーに選ばせる（初期ファイル名を生成）
-        start_h = self.sec_to_hhmmss(int(self.start_time))
-        start_frame = int((self.start_time - int(self.start_time)) * max(1, self.fps))
-        end_h = self.sec_to_hhmmss(int(self.end_time))
-        end_frame = int((self.end_time - int(self.end_time)) * max(1, self.fps))
-        default_name = f"{self.video_filename}_trim_{start_h}_{start_frame:03d}_{end_h}_{end_frame:03d}.mp4"
-        video_dir = os.path.dirname(self.video_filepath) if self.video_filepath else None
-        save_path = filedialog.asksaveasfilename(defaultextension='.mp4', initialfile=default_name,
-                             initialdir=video_dir,
-                             filetypes=[('MP4', '*.mp4')], title='保存先とファイル名を選択')
-        if not save_path:
-            return
-        save_dir = os.path.dirname(save_path)
-
-        # 座標変換（crop_rectは640x360基準、実際の動画サイズに変換）
-        x1, y1, x2, y2 = self.crop_rect
-        vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        sx = vid_w / self.CANVAS_W
-        sy = vid_h / self.CANVAS_H
-        vx1, vy1 = int(x1*sx), int(y1*sy)
-        vx2, vy2 = int(x2*sx), int(y2*sy)
-
-        # クロップ後のサイズ
-        crop_w = vx2 - vx1
-        crop_h = vy2 - vy1
-
-        if crop_w <= 0 or crop_h <= 0:
-            messagebox.showerror("Error", "クロップ範囲が無効です")
-            return
-
-        # 再生を一時停止
-        was_playing = self.playing
-        self.playing = False
-        if self._play_after_id:
-            self.root.after_cancel(self._play_after_id)
-
-        try:
-            # VideoWriter の設定
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # mp4v コーデック
-            out = cv2.VideoWriter(save_path, fourcc, self.fps, (crop_w, crop_h))
-
-            if not out.isOpened():
-                messagebox.showerror("Error", "動画ファイルを作成できませんでした")
-                return
-
-            # start_time から end_time までのフレームを処理
-            t = self.start_time
-            limit = self.end_time
-            frame_interval = 1.0 / self.fps
-            frame_count = 0
-
-            while t <= limit:
-                self.cap.set(cv2.CAP_PROP_POS_MSEC, t*1000)
-                ret, frm = self.cap.read()
-                if ret and frm is not None:
-                    # クロップ
-                    crop = frm[vy1:vy2, vx1:vx2]
-                    if crop.size > 0:
-                        out.write(crop)
-                        frame_count += 1
-                t += frame_interval
-
-            out.release()
-
-            # 完了ダイアログとフォルダを開くかの確認
-            open_now = messagebox.askyesno("完了", f"動画を保存しました。\n{frame_count} フレーム\nフォルダを開きますか？")
-            if open_now:
-                self.open_folder(save_dir)
-        except Exception as e:
-            messagebox.showerror("Error", f"動画保存中にエラーが発生しました:\n{e}")
-        finally:
-            self.playing = was_playing
-            if self.playing:
-                self.play_step()
-
 
 if __name__ == "__main__":
     root = tk.Tk()
