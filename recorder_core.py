@@ -12,6 +12,7 @@ import mss
 import numpy as np
 
 from window_utils import WindowUtils
+from wgc_capture import WGCCapture
 
 
 class ScreenRecorderLogic:
@@ -31,7 +32,6 @@ class ScreenRecorderLogic:
         rect: Dict[str, int],
         fps: int,
         hwnd: Optional[Any] = None,
-        record_cursor: bool = False,
         record_tsv: bool = True,
         exclusive_window: bool = False
     ):
@@ -46,7 +46,7 @@ class ScreenRecorderLogic:
 
         self.recording_thread = threading.Thread(
             target=self._record_loop,
-            args=(filepath, rect, fps, hwnd, record_cursor, record_tsv, exclusive_window)
+            args=(filepath, rect, fps, hwnd, record_tsv, exclusive_window)
         )
         self.recording_thread.start()
 
@@ -90,7 +90,6 @@ class ScreenRecorderLogic:
         rect: Dict[str, int],
         fps: int,
         hwnd: Optional[Any],
-        record_cursor: bool,
         record_tsv: bool,
         exclusive_window: bool
     ):
@@ -111,73 +110,92 @@ class ScreenRecorderLogic:
         start_time = time.time()
         frame_idx = 0
         
-        with mss.mss() as sct:
-            while not self.stop_event.is_set():
-                now = time.time()
-                if now >= next_time:
-                    # 追従時にDWMの正確な位置を取得
-                    if hwnd:
+        wgc: Optional[WGCCapture] = None
+        if exclusive_window and hwnd:
+            try:
+                wgc = WGCCapture(hwnd)
+                # WGC が正常に初期化されたか確認 (session が None なら失敗)
+                if wgc.session is None:
+                    print("WGC session not initialized, falling back to PrintWindow")
+                    wgc.close()
+                    wgc = None
+            except Exception as e:
+                print(f"WGC Startup Error: {e}")
+                wgc = None  # PrintWindow フォールバックを使用
+
+        try:
+            with mss.mss() as sct:
+                while not self.stop_event.is_set():
+                    now = time.time()
+                    if now >= next_time:
+                        # 追従時にDWMの正確な位置を取得
+                        if hwnd and not wgc: # WGC使用時はHWNDから直接取るので追従処理不要
+                            try:
+                                updated_rect = self.window_utils.get_window_rect(hwnd)
+                                if updated_rect:
+                                    rect = updated_rect
+                            except:
+                                pass
+
                         try:
-                            updated_rect = self.window_utils.get_window_rect(hwnd)
-                            if updated_rect:
-                                rect = updated_rect
-                        except:
-                            pass
+                            frame = None
+                            capture_success = False
 
-                    try:
-                        frame = None
-                        capture_success = False
+                            # Windows Graphics Capture (WGC)
+                            if wgc:
+                                frame = wgc.get_latest_frame()
+                                if frame is not None:
+                                    capture_success = True
 
-                        # ウィンドウ個別キャプチャ
-                        if exclusive_window and hwnd:
-                            frame = self.window_utils.capture_exclusive_window(hwnd)
-                            if frame is not None:
+                            # WGC失敗時または WGC未使用時の独占モード -> PrintWindow
+                            if not capture_success and exclusive_window and hwnd:
+                                try:
+                                    frame_bgr = self.window_utils.capture_exclusive_window(hwnd)
+                                    if frame_bgr is not None:
+                                        frame = frame_bgr
+                                        capture_success = True
+                                except Exception:
+                                    pass
+                            
+                            # 通常のmssキャプチャ (独占モードでない場合のみ)
+                            if not capture_success and not exclusive_window:
+                                img_sct = sct.grab(rect)
+                                frame = np.array(img_sct)
+                                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                                 capture_success = True
                         
-                        # 通常のmssキャプチャ
-                        if not capture_success:
-                            img_sct = sct.grab(rect)
-                            frame = np.array(img_sct)
-                            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                            capture_success = True
-                        
-                        if capture_success and frame is not None:
-                            # サイズ調整
-                            if frame.shape[1] != w or frame.shape[0] != h:
-                                frame = cv2.resize(frame, (w, h))
+                            if capture_success and frame is not None:
+                                # サイズ調整
+                                if frame.shape[1] != w or frame.shape[0] != h:
+                                    frame = cv2.resize(frame, (w, h))
 
-                            # マウス座標取得 (screen relative)
-                            # ポインター位置取得のためにWinAPIを使う (Tkinter依存を避ける)
-                            pt = ctypes.wintypes.POINT()
-                            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-                            cursor_x, cursor_y = pt.x, pt.y
-                            
-                            # 動画内相対座標の計算
-                            rel_x = cursor_x - rect['left']
-                            rel_y = cursor_y - rect['top']
-                            
-                            if record_tsv:
-                                click_info, keys_info = self._get_input_state()
+                                # マウス座標取得 (screen relative)
+                                # ポインター位置取得のためにWinAPIを使う (Tkinter依存を避ける)
+                                pt = ctypes.wintypes.POINT()
+                                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                                cursor_x, cursor_y = pt.x, pt.y
                                 
-                                self.trajectory_data.append((
-                                    round(now - start_time, 3), 
-                                    frame_idx, 
-                                    rel_x, 
-                                    rel_y, 
-                                    click_info,
-                                    ','.join(keys_info) if keys_info else "None"
-                                ))
+                                # 動画内相対座標の計算
+                                rel_x = cursor_x - rect['left']
+                                rel_y = cursor_y - rect['top']
+                                
+                                if record_tsv:
+                                    click_info, keys_info = self._get_input_state()
+                                    
+                                    self.trajectory_data.append((
+                                        round(now - start_time, 3), 
+                                        frame_idx, 
+                                        rel_x, 
+                                        rel_y, 
+                                        click_info,
+                                        ','.join(keys_info) if keys_info else "None"
+                                    ))
 
-                            # 動画へのマウスポインタ直接描画
-                            if record_cursor:
-                                if 0 <= rel_x < w and 0 <= rel_y < h:
-                                    cv2.circle(frame, (rel_x, rel_y), 5, (255, 255, 255), -1)
-                                    cv2.circle(frame, (rel_x, rel_y), 5, (0, 0, 0), 1)
-                            
-                            out.write(frame)
-                            frame_idx += 1
-                    except Exception as e:
-                        print(f"Record Error: {e}")
+                                # フレーム書き込み（TSV設定に関わらず実行）
+                                out.write(frame)
+                                frame_idx += 1
+                        except Exception as e:
+                            print(f"Record Error: {e}")
                     
                     next_time += interval
                     # スリープでCPU負荷調整
@@ -187,7 +205,10 @@ class ScreenRecorderLogic:
                 else:
                     time.sleep(0.001)
         
-        out.release()
+        finally:
+            if wgc:
+                wgc.close()
+            out.release()
 
     def _get_input_state(self) -> tuple[str, List[str]]:
         """現在のマウス・キーボード入力状態を取得する."""
@@ -208,14 +229,33 @@ class ScreenRecorderLogic:
         if ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000: keys_info.append("Alt")
         if (ctypes.windll.user32.GetAsyncKeyState(0x5B) & 0x8000) or (ctypes.windll.user32.GetAsyncKeyState(0x5C) & 0x8000):
             keys_info.append("Win")
+        # 稀に 0x5B/0x5C で取れない環境があるための予備判定 (VK_LWIN/VK_RWIN は標準的なので基本は通るはず)
         
         # 一般キー
         for vk, name in [(0x0D, "Enter"), (0x20, "Space"), (0x1B, "Esc"), (0x08, "BS"), (0x09, "Tab"), (0x2E, "Del")]:
             if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
                 keys_info.append(name)
         
+        # ナビゲーションキー
+        for vk, name in [
+            (0x21, "PageUp"), (0x22, "PageDown"), (0x23, "End"), (0x24, "Home"), (0x2D, "Insert")
+        ]:
+            if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
+                keys_info.append(name)
+
         # 方向キー
         for vk, name in [(0x25, "Left"), (0x26, "Up"), (0x27, "Right"), (0x28, "Down")]:
+            if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
+                keys_info.append(name)
+
+        # ファンクションキー (F1-F12)
+        for vk in range(0x70, 0x7C):
+            name = f"F{vk - 0x6F}"
+            if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
+                keys_info.append(name)
+
+        # その他特殊キー
+        for vk, name in [(0x2C, "PrintScreen"), (0x13, "Pause"), (0x14, "CapsLock"), (0x91, "ScrollLock")]:
             if ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000:
                 keys_info.append(name)
 

@@ -88,7 +88,7 @@ def load_global_config() -> dict[str, Any]:
             "edge_margin": 20,
             
             # ボタンの色 (パステル配色)
-            "button_play_bg": "#A5D6A7",    # 薄い緑
+            "button_play_bg": "#B3E5FC",    # 薄い青 (button_undo_bgと共通)
             "button_stop_bg": "#EF9A9A",    # 薄い赤
             "button_export_bg": "#F48FB1",  # 薄いピンク
             "button_video_bg": "#81C784",   # パステル緑
@@ -100,14 +100,67 @@ def load_global_config() -> dict[str, Any]:
             "button_help_bg": "#FFF59D",    # 薄い黄色
             "button_reload_bg": "#FFCC80",  # 薄いオレンジ
             "button_save_bg": "#90CAF9",    # 薄い青色
-            "button_trim_start_bg": "#EDE7F6", # 最淡パステル紫色
-            "button_trim_end_bg": "#FFEBEE",   # 最淡パステル赤色
+            "button_trim_start_bg": "#77BB77", # 開始色 (start_color_bgと共通)
+            "button_trim_end_bg": "#FF7777",   # 終了色 (end_color_bgと共通)
             "button_undo_bg": "#B3E5FC",    # 薄い青
             "button_redo_bg": "#B3E5FC",    # 薄い青
             "button_locked_bg": "#FFAB91",   # 薄い赤（ロック中）
             "button_unlocked_bg": "#B9F6CA", # 薄い緑（解除中）
             "start_color_bg": "#77BB77",     # 開始カラー
             "end_color_bg": "#FF7777",       # 終了カラー
+
+            # マウス軌跡オーバーレイ設定
+            "mouse_overlay": {
+                # ポインタ（通常時）の設定
+                "pointer": {
+                    "shape": "cursor",        # ポインタ位置を示す形状 (circle, square, cursor)
+                    "color": "#000000",       # ポインタの罫線の色 (既定: 黒)
+                    "width": 2,               # ポインタの罫線の太さ
+                    "fill": "",               # ポインタの塗りつぶしの色（空文字なら透明）
+                    "radius": 6               # ポインタの半径/サイズ
+                },
+                # 左クリック時の設定
+                "click_left": {
+                    "color": "#FF0000",       # 左クリック時の強調色 (既定: 赤)
+                    "shape": "circle",        # 左クリック時の形状
+                    "width": 3,               # 左クリック時の太さ
+                    "ripple_duration": 0.5,   # 左クリックを離した時の波紋が消えるまでの時間（秒）
+                    "ripple_range": 20        # 左クリックを離した時の波紋の広がる範囲（ピクセル）
+                },
+                # 右クリック時の設定
+                "click_right": {
+                    "color": "#0000FF",       # 右クリック時の強調色 (既定: 青)
+                    "shape": "circle",        # 右クリック時の形状
+                    "width": 3,               # 右クリック時の太さ
+                    "ripple_duration": 0.5,   # 右クリックを離した時の波紋が消えるまでの時間（秒）
+                    "ripple_range": 20        # 右クリックを離した時の波紋の広がる範囲（ピクセル）
+                },
+                # 中クリック時の設定
+                "click_middle": {
+                    "color": "#00FF00",       # 中クリック時の強調色 (既定: 緑)
+                    "shape": "circle",        # 中クリック時の形状
+                    "width": 3,               # 中クリック時の太さ
+                    "ripple_duration": 0.5,   # 中クリックを離した時の波紋が消えるまでの時間（秒）
+                    "ripple_range": 20        # 中クリックを離した時の波紋の広がる範囲（ピクセル）
+                }
+            },
+            
+            # 入力（キー・マウス操作）オーバーレイ設定
+            "input_overlay": {
+                "position": "center",         # 文字の位置（left, right, center）
+                "v_position": "bottom",       # 上下位置（top, center, bottom）
+                "font_family": "msgothic.ttc",# フォントの種類（msgothic.ttc, meiryo.ttc 等、OS標準フォント推奨）
+                "font_size": 24,              # 文字の大きさ
+                "font_weight": "bold",        # 文字の太さ
+                "font_color": "#000000",      # 文字の前景色
+                "outline_color": "",          # 文字のアウトライン色（空文字ならOFF）
+                "bg_color": "#FFFFFF",        # 入力を描く四角形の背景塗りつぶし色
+                "offset_x": 0,                # 表示領域の横オフセット
+                "offset_y": 0,                # 表示領域の縦オフセット
+                "text_offset_y": -2,          # 文字の描画位置の微調整（負の数で上に移動）
+                "max_stack": 3,               # 最大表示数
+                "fade_duration": 1.0          # 入力を離してから文字が消えるまでの時間（秒）
+            }
         },
         "window_x": None,
         "window_y": None,
@@ -215,6 +268,7 @@ def save_video_settings(
     start_time: float,
     end_time: float,
     current_time: float = 0.0,
+    allow_oversize: bool = False,
     additional_data: dict[str, Any] | None = None
 ) -> str | None:
     """動画個別の設定ファイルに保存する."""
@@ -232,7 +286,8 @@ def save_video_settings(
         },
         'start_time': start_time,
         'end_time': end_time,
-        'current_time': current_time
+        'current_time': current_time,
+        'allow_oversize': allow_oversize
     }
     if additional_data:
         data.update(additional_data)

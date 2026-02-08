@@ -13,9 +13,11 @@ import sys
 
 import cv2
 import screen_recorder
+import overlay_utils
 from PIL import Image, ImageTk
 
 # 分割したモジュールからインポート
+from export import open_file
 from utils import (
     get_base_dir,
     sec_to_hhmmss,
@@ -24,6 +26,7 @@ from utils import (
     imwrite_jp,
     ratio_value_from_str,
     ratio_label_from_wh,
+    open_folder_with_selection,
 )
 from config import (
     CONFIG_FILENAME,
@@ -70,7 +73,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
     def __init__(self, root):
         self.root = root
-        self.root.title("動画クリップ取得ツール - Created By ことりちゅん - v0.2.2")
+        self.root.title("ChulipVideo - Created By ことりちゅん - v0.2.3")
         
         # Load global config for theme
         self.global_config = load_global_config()
@@ -154,30 +157,33 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # マウス軌跡のTSVデータ用
         self.trajectory_data = [] # list of (time, x, y)
         self.show_trajectory_var = tk.BooleanVar(value=self.global_config.get("show_trajectory", True))
+        self.show_subtitle_var = tk.BooleanVar(value=self.global_config.get("show_subtitle", True))
+        self.embed_overlay_var = tk.BooleanVar(value=self.global_config.get("embed_overlay", False))
+        self.allow_oversize_var = tk.BooleanVar(value=False)
 
         # UIを先に構築
         self.build_ui()
 
         self._play_after_id = None
         # スペースキーをどのウィジェットにフォーカスがあっても捕まえる
-        self.root.bind_all("<space>", lambda e: self.toggle_play())
+        self.root.bind_all("<space>", lambda e: not self.suppress_shortcuts and self.toggle_play())
         # Undo with Ctrl+Z
-        self.root.bind_all("<Control-z>", lambda e: self.undo_crop())
-        self.root.bind_all("<Control-Z>", lambda e: self.undo_crop())
+        self.root.bind_all("<Control-z>", lambda e: not self.suppress_shortcuts and self.undo_crop())
+        self.root.bind_all("<Control-Z>", lambda e: not self.suppress_shortcuts and self.undo_crop())
         # Copy crop to clipboard with Ctrl+C
-        self.root.bind_all("<Control-c>", lambda e: self.copy_crop_to_clipboard())
-        self.root.bind_all("<Control-C>", lambda e: self.copy_crop_to_clipboard())
+        self.root.bind_all("<Control-c>", lambda e: not self.suppress_shortcuts and self.copy_crop_to_clipboard())
+        self.root.bind_all("<Control-C>", lambda e: not self.suppress_shortcuts and self.copy_crop_to_clipboard())
         # Redo with Ctrl+Y
-        self.root.bind_all("<Control-y>", lambda e: self.redo_crop())
-        self.root.bind_all("<Control-Y>", lambda e: self.redo_crop())
+        self.root.bind_all("<Control-y>", lambda e: not self.suppress_shortcuts and self.redo_crop())
+        self.root.bind_all("<Control-Y>", lambda e: not self.suppress_shortcuts and self.redo_crop())
         # Arrow key repeat handlers (Left/Right)
         self._arrow_repeat_id = None
         self._arrow_dir = None
         self._arrow_start_time = None
-        self.root.bind_all('<KeyPress-Left>', lambda e: self._on_arrow_press(e, -1))
-        self.root.bind_all('<KeyRelease-Left>', lambda e: self._on_arrow_release(e))
-        self.root.bind_all('<KeyPress-Right>', lambda e: self._on_arrow_press(e, 1))
-        self.root.bind_all('<KeyRelease-Right>', lambda e: self._on_arrow_release(e))
+        self.root.bind_all('<KeyPress-Left>', lambda e: not self.suppress_shortcuts and self._on_arrow_press(e, -1))
+        self.root.bind_all('<KeyRelease-Left>', lambda e: not self.suppress_shortcuts and self._on_arrow_release(e))
+        self.root.bind_all('<KeyPress-Right>', lambda e: not self.suppress_shortcuts and self._on_arrow_press(e, 1))
+        self.root.bind_all('<KeyRelease-Right>', lambda e: not self.suppress_shortcuts and self._on_arrow_release(e))
         # Alt+矢印でクロップ矩形を移動（Ctrl併用で10px）
         self.root.bind_all('<Alt-Up>', lambda e: (self.move_crop_by(0, -10 if (e.state & 0x4) else -1) or "break"))
         self.root.bind_all('<Alt-Down>', lambda e: (self.move_crop_by(0, 10 if (e.state & 0x4) else 1) or "break"))
@@ -189,13 +195,18 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.root.bind_all('<Shift-Left>', lambda e: (self.expand_crop(-10 if (e.state & 0x4) else -1, 0) or "break"))
         self.root.bind_all('<Shift-Right>', lambda e: (self.expand_crop(10 if (e.state & 0x4) else 1, 0) or "break"))
         # Home/End bindings
-        self.root.bind_all('<Home>', lambda e: self.set_current_time_direct(self.start_time))
-        self.root.bind_all('<End>', lambda e: self.set_current_time_direct(self.end_time))
-        self.root.bind_all('<Control-Home>', lambda e: self.set_current_time_direct(0))
-        self.root.bind_all('<Control-End>', lambda e: self.set_current_time_direct(self.duration))
+        self.root.bind_all('<Home>', lambda e: not self.suppress_shortcuts and self.set_current_time_direct(self.start_time))
+        self.root.bind_all('<End>', lambda e: not self.suppress_shortcuts and self.set_current_time_direct(self.end_time))
+        self.root.bind_all('<Control-Home>', lambda e: not self.suppress_shortcuts and self.set_current_time_direct(0))
+        self.root.bind_all('<Control-End>', lambda e: not self.suppress_shortcuts and self.set_current_time_direct(self.duration))
         # Ctrl+Sで現在のクロップ範囲をPNGとして保存
-        self.root.bind_all('<Control-s>', lambda e: self.save_current_frame_as_png())
-        self.root.bind_all('<Control-S>', lambda e: self.save_current_frame_as_png())
+        self.root.bind_all('<Control-s>', lambda e: not self.suppress_shortcuts and self.save_current_frame_as_png())
+        self.root.bind_all('<Control-S>', lambda e: not self.suppress_shortcuts and self.save_current_frame_as_png())
+        
+        # マウスの4, 5ボタン (戻る/進む) -> -1s, +1s
+        # Windows の Tkinter では一般に Button-4, Button-5 がサイドボタンに割り当てられます
+        self.root.bind_all("<Button-4>", lambda e: not self.suppress_shortcuts and self.adjust_time(lambda: self.current_time, self.set_current_time_direct, -1))
+        self.root.bind_all("<Button-5>", lambda e: not self.suppress_shortcuts and self.adjust_time(lambda: self.current_time, self.set_current_time_direct, 1))
 
         # ウィンドウ終了時に設定を保存
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
@@ -209,55 +220,87 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # 起動100ms後にレイアウト調整（シークバー等のリサイズ確実化）
         self.root.after(100, lambda: self.on_canvas_resize(None))
 
+        # 入力履歴管理
+        from overlay_utils import InputHistoryManager
+        self.input_history_manager = InputHistoryManager()
+
+        # ショートカット抑制フラグ (詳細設定でのテスト用)
+        self.suppress_shortcuts = False
+
     # ---------------- UI Construction ----------------
     def build_ui(self):
+        # Top用フォント (カラー絵文字対応: Segoe UI Emoji)
+        top_font = ("Segoe UI Emoji", 12)
+        
         # Top: Load path and controls
         top_panel = tk.Frame(self.root)
-        top_panel.pack(fill=tk.X, side=tk.TOP, padx=5, pady=3)
+        top_panel.pack(fill=tk.X, side=tk.TOP, padx=5, pady=6)
 
         # 録画ツール起動ボタン (赤系 -> Theme)
         btn_bg = self.theme.get("main_color")
-        tk.Button(top_panel, text="録画ツール", command=self.open_screen_recorder,
-                  bg=btn_bg, width=10).pack(side=tk.LEFT, padx=5)
+        btn_rec = tk.Button(top_panel, text="🎥録画", command=self.open_screen_recorder,
+                  bg=btn_bg, width=6, font=top_font)
+        btn_rec.pack(side=tk.LEFT, padx=5)
+        self.add_tooltip(btn_rec, "録画ツールを起動する")
 
-        btn_open = tk.Button(top_panel, text="動画を選択", command=self.load_video,
-                  width=10, bg=self.theme.get("button_normal_bg"))
+        btn_open = tk.Button(top_panel, text="🎞️選択", command=self.load_video,
+                  width=6, bg=self.theme.get("button_normal_bg"), font=top_font)
         btn_open.pack(side=tk.LEFT, padx=5)
-        self.add_tooltip(btn_open, "動画ファイルを開く")
+        self.add_tooltip(btn_open, "動画ファイルを選択して開く")
 
         self.entry_fullpath_var = tk.StringVar(value="")
-        self.entry_fullpath = tk.Entry(top_panel, textvariable=self.entry_fullpath_var)
-        self.entry_fullpath.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,5))
+        self.entry_fullpath = tk.Entry(top_panel, textvariable=self.entry_fullpath_var, font=top_font)
+        self.entry_fullpath.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,2))
+
+        # 保存フォルダを開くボタン (フォルダアイコン 📂)
+        btn_folder = tk.Button(top_panel, text="📂", 
+                               command=lambda: open_folder_with_selection(self.video_filepath), 
+                               width=3, bg=self.theme.get("button_normal_bg"), font=top_font)
+        btn_folder.pack(side=tk.LEFT, padx=(0,5))
+        self.add_tooltip(btn_folder, "保存フォルダを開く")
+
+        # TSVデータを開くボタン (テキストアイコン 📄)
+        btn_tsv = tk.Button(top_panel, text="📄", 
+                            command=self.open_current_tsv, 
+                            width=3, bg=self.theme.get("button_normal_bg"), font=top_font)
+        btn_tsv.pack(side=tk.LEFT, padx=(0,5))
+        self.add_tooltip(btn_tsv, "TSVファイルを開く")
+        
+        # 設定表示ボタン
+        btn_check = tk.Button(top_panel, text="⚙️", command=self.open_video_settings, 
+                               width=3, bg=self.theme.get("button_normal_bg"), font=top_font)
+        btn_check.pack(side=tk.LEFT, padx=(0,5))
+        self.add_tooltip(btn_check, "動画の【トリム/クロップ設定TSV】を開く")
+
+        # 再読み込みボタン
+        btn_reload = tk.Button(top_panel, text="🔃", command=self.load_config, 
+                               width=3, bg=self.theme.get("button_reload_bg"), font=top_font)
+        btn_reload.pack(side=tk.LEFT, padx=(0,5))
+        self.add_tooltip(btn_reload, "【動画】・【トリム/クロップ設定JSON】・【入力履歴】を再読み込み")
+        
+        # 設定保存ボタン
+        btn_save = tk.Button(top_panel, text="💾", command=self.save_video_settings, 
+                             width=3, bg=self.theme.get("button_save_bg"), font=top_font)
+        btn_save.pack(side=tk.LEFT, padx=(0,5))
+        self.add_tooltip(btn_save, "動画の【トリム/クロップ設定JSON】を保存する")
 
         # 秒数表示ラベル（右隣）
-        self.label_seconds = tk.Label(top_panel, text="(0s)")
+        self.label_seconds = tk.Label(top_panel, text="(0s)", font=top_font)
         self.label_seconds.pack(side=tk.LEFT, padx=5)
 
         # 右上のヘルプボタン（ショートカット一覧）
-        self.btn_help = tk.Button(top_panel, text="?", command=self.show_shortcuts, width=3, bg=self.theme.get("button_help_bg"))
+        self.btn_help = tk.Button(top_panel, text="❓️", command=self.show_shortcuts, 
+                                  width=3, bg=self.theme.get("button_help_bg"), font=top_font)
         self.btn_help.pack(side=tk.RIGHT, padx=4)
-        self.add_tooltip(self.btn_help, "ショートカット一覧を表示")
-
-        # 動画設定ボタン(右上端の「?」の左に並べる)
-        btn_reload = tk.Button(top_panel, text="再読込", command=self.load_config, width=8, bg=self.theme.get("button_reload_bg"))
-        btn_reload.pack(side=tk.RIGHT, padx=2)
-        self.add_tooltip(btn_reload, "設定を再読み込み (Ctrl+R)")
-        
-        btn_check = tk.Button(top_panel, text="設定確認", command=self.open_video_settings, width=8, bg=self.theme.get("button_normal_bg"))
-        btn_check.pack(side=tk.RIGHT, padx=2)
-        self.add_tooltip(btn_check, "動画固有の現在の設定値を表示")
-        
-        btn_save = tk.Button(top_panel, text="設定保存", command=self.save_video_settings, width=8, bg=self.theme.get("button_save_bg"))
-        btn_save.pack(side=tk.RIGHT, padx=2)
-        self.add_tooltip(btn_save, "動画固有の設定(トリム/クロップ)を保存 (Ctrl+S)")
+        self.add_tooltip(self.btn_help, "ショートカット一覧を表示する")
 
         # FPS表示ラベル (保存ボタンの左)
-        self.label_fps = tk.Label(top_panel, text="--FPS", font=("Consolas", 10, "bold"), fg="#666666")
+        self.label_fps = tk.Label(top_panel, text="--FPS", font=("Consolas", 14, "bold"), fg="#666666")
         self.label_fps.pack(side=tk.RIGHT, padx=10)
         self.add_tooltip(self.label_fps, "動画の1秒あたりのフレーム数(FPS)")
 
         # 表示倍率ラベル (FPSボタンの左)
-        self.label_zoom = tk.Label(top_panel, text="100%", font=("Consolas", 10, "bold"), fg="#666666")
+        self.label_zoom = tk.Label(top_panel, text="100%", font=("Consolas", 14, "bold"), fg="#666666")
         self.label_zoom.pack(side=tk.RIGHT, padx=10)
         self.add_tooltip(self.label_zoom, "現在の動画表示倍率")
 
@@ -306,8 +349,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.canvas.bind("<Double-Button-2>", self.on_middle_double_click)
         # マウスホイールでズーム（Windows と X11 両対応）
         self.canvas.bind("<MouseWheel>", self.on_canvas_wheel)
-        self.canvas.bind("<Button-4>", self.on_canvas_wheel)
-        self.canvas.bind("<Button-5>", self.on_canvas_wheel)
+        # Note: Button-4/5 は Windows ではサイドボタンとして global bind したため、ここでは不要
 
         
         control_frame = tk.Frame(control_pane, bg="#f5f5f5")
@@ -324,7 +366,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.btn_trim_start.pack(side=tk.LEFT, padx=4)
         self.add_tooltip(self.btn_trim_start, "Home: 開始位置へ")
 
-        self.btn_play = tk.Button(main_ctrl, text="▲再生", command=self.toggle_play, width=12, bg=self.theme.get("button_play_bg"))
+        self.btn_play = tk.Button(main_ctrl, text="▲再生", command=self.toggle_play, width=12, bg=self.theme.get("button_play_bg", "#B3E5FC"))
         # 区間再生はチェックボックス化（末尾ボタンの右）
         self.btn_play.pack(side=tk.LEFT, padx=4)
         self.add_tooltip(self.btn_play, "Space: 再生/停止")
@@ -456,159 +498,224 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         self.entry_end.bind('<space>', _ignore_space)
 
 
-        # 2.7. Crop Size Input Panel (placed below trimming range per user request)
-        crop_panel = tk.LabelFrame(control_frame, text="クロップ範囲", bd=1,
-                                  relief=tk.SOLID, padx=5, pady=5)
+        # 2.7. クロップサイズ入力パネル (フィードバックを反映した精密レイアウト)
+        crop_panel = tk.LabelFrame(control_frame, text="クロップ範囲", bd=1, relief=tk.SOLID, padx=5, pady=5)
         crop_panel.pack(pady=5, fill=tk.X, padx=10)
 
-        size_ctrl = tk.Frame(crop_panel)
-        size_ctrl.pack()
+        # 全要素を横に並べるメインコンテナ (確実に水平中央に配置しつつ垂直拡張)
+        self.crop_hbox = tk.Frame(crop_panel)
+        self.crop_hbox.pack(fill=tk.Y, expand=True, anchor=tk.CENTER)
+        
+        # 不要な外部へのサイド余白を削り、中央寄せを強調
 
-        # 戻すボタン（Undo）
-        # 幅を文字数に合わせ、fontを調整して中央配置を確実にする
-        self.btn_undo = tk.Button(size_ctrl, text="↩️", command=self.undo_crop, width=4, font=("Segoe UI Emoji", 12), bg=self.theme.get("button_undo_bg"), relief=tk.RAISED)
-        self.btn_undo.pack(side=tk.LEFT, padx=4)
+        # --- セクション 1: 操作履歴 (Undo / Redo 横並び) ---
+        sec1 = tk.Frame(self.crop_hbox)
+        sec1.pack(side=tk.LEFT, padx=5, fill=tk.Y)
+        self.btn_undo = tk.Button(sec1, text="↩️", command=self.undo_crop, width=5, font=("Segoe UI Emoji", 11), bg=self.theme.get("button_undo_bg"), relief=tk.RAISED)
+        self.btn_undo.pack(side=tk.LEFT, padx=1, fill=tk.Y)
         self.btn_undo.config(state=tk.DISABLED)
         self.add_tooltip(self.btn_undo, "Ctrl+Z: 戻す")
-        # 進むボタン（Redo）
-        self.btn_redo = tk.Button(size_ctrl, text="↪️", command=self.redo_crop, width=4, font=("Segoe UI Emoji", 12), bg=self.theme.get("button_redo_bg"), relief=tk.RAISED)
-        self.btn_redo.pack(side=tk.LEFT, padx=4)
+        self.btn_redo = tk.Button(sec1, text="↪️", command=self.redo_crop, width=5, font=("Segoe UI Emoji", 11), bg=self.theme.get("button_redo_bg"), relief=tk.RAISED)
+        self.btn_redo.pack(side=tk.LEFT, padx=1, fill=tk.Y)
         self.btn_redo.config(state=tk.DISABLED)
         self.add_tooltip(self.btn_redo, "Ctrl+Y: 進む")
 
-        # 座標パネルラベルとロックボタン
-        ttk.Separator(size_ctrl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        tk.Label(size_ctrl, text="座標:").pack(side=tk.LEFT, padx=(5,0))
-        self.btn_lock_move = tk.Button(size_ctrl, text="🔓", width=3, font=("Consolas", 14, "bold"), bg=self.theme.get("button_unlocked_bg"), command=self.toggle_move_lock)
-        self.btn_lock_move.pack(side=tk.LEFT, padx=(2,5))
+        ttk.Separator(self.crop_hbox, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        # --- 枠外選択 ---
+        sec_opt = tk.Frame(self.crop_hbox)
+        sec_opt.pack(side=tk.LEFT, padx=5, fill=tk.Y)
+        tk.Checkbutton(sec_opt, text="枠外\n選択", variable=self.allow_oversize_var).pack(side=tk.LEFT)
+        
+        ttk.Separator(self.crop_hbox, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        # --- セクション 2: 座標 ---
+        sec2 = tk.Frame(self.crop_hbox)
+        sec2.pack(side=tk.LEFT, padx=5, fill=tk.Y)
+        tk.Label(sec2, text="座標:").pack(side=tk.LEFT, padx=(0,5))
+        
+        # 2段分の高さを持つ Lock ボタン (正方形)
+        self.btn_lock_move = tk.Button(sec2, text="🔓", width=5, font=("Consolas", 12, "bold"), bg=self.theme.get("button_unlocked_bg"), command=self.toggle_move_lock)
+        self.btn_lock_move.pack(side=tk.LEFT, fill=tk.Y, padx=(0,5), expand=True) # expand=True 追加
         self.add_tooltip(self.btn_lock_move, "クロップ位置(X, Y)をロック (リサイズは可能)")
 
-        # X座標入力
-        tk.Label(size_ctrl, text="X:").pack(side=tk.LEFT, padx=2)
-        self.entry_crop_x = tk.Entry(
-            size_ctrl, width=8, font=("Consolas", 12), justify="center")
-        self.entry_crop_x.insert(0, "100")
-        self.entry_crop_x.pack(side=tk.LEFT, padx=2)
-        self.entry_crop_x.bind(
-            "<Return>", lambda e: self.update_crop_from_entries())
-        self.entry_crop_x.bind(
-            "<FocusOut>", lambda e: self.update_crop_from_entries())
+        # X/Y のペア (上下2段)
+        pair2 = tk.Frame(sec2)
+        pair2.pack(side=tk.LEFT, fill=tk.Y, expand=True) # expand=True 追加
+        # 上段: X
+        f2a = tk.Frame(pair2)
+        f2a.pack(side=tk.TOP, fill=tk.X, expand=True)
+        tk.Label(f2a, text="X:", width=2).pack(side=tk.LEFT)
+        self.entry_crop_x = tk.Entry(f2a, width=6, font=("Consolas", 11), justify="center")
+        self.entry_crop_x.pack(side=tk.LEFT)
+        self.entry_crop_x.bind("<Return>", lambda e: self.update_crop_from_entries())
+        self.entry_crop_x.bind("<FocusOut>", lambda e: self.update_crop_from_entries())
         self.add_tooltip(self.entry_crop_x, "クロップ開始X座標 (Alt+左右で1px移動, Shift+左右で幅を拡大縮小)")
-
-        # Y座標入力
-        tk.Label(size_ctrl, text="Y:").pack(side=tk.LEFT, padx=5)
-        self.entry_crop_y = tk.Entry(
-            size_ctrl, width=8, font=("Consolas", 12), justify="center")
-        self.entry_crop_y.insert(0, "80")
-        self.entry_crop_y.pack(side=tk.LEFT, padx=2)
-        self.entry_crop_y.bind(
-            "<Return>", lambda e: self.update_crop_from_entries())
-        self.entry_crop_y.bind(
-            "<FocusOut>", lambda e: self.update_crop_from_entries())
+        # 下段: Y
+        f2b = tk.Frame(pair2)
+        f2b.pack(side=tk.TOP, fill=tk.X, expand=True, pady=(2,0))
+        tk.Label(f2b, text="Y:", width=2).pack(side=tk.LEFT)
+        self.entry_crop_y = tk.Entry(f2b, width=6, font=("Consolas", 11), justify="center")
+        self.entry_crop_y.pack(side=tk.LEFT)
+        self.entry_crop_y.bind("<Return>", lambda e: self.update_crop_from_entries())
+        self.entry_crop_y.bind("<FocusOut>", lambda e: self.update_crop_from_entries())
         self.add_tooltip(self.entry_crop_y, "クロップ開始Y座標 (Alt+上下で1px移動, Shift+上下で高さを拡大縮小)")
 
-        # 幅と高さ選択
-        ttk.Separator(size_ctrl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        tk.Label(size_ctrl, text="解像度:").pack(side=tk.LEFT, padx=5)
-        # 解像度ロックボタン
-        self.btn_lock_res = tk.Button(size_ctrl, text="🔓", width=3, font=("Consolas", 14, "bold"), bg=self.theme.get("button_unlocked_bg"), command=self.toggle_resolution_lock)
-        self.btn_lock_res.pack(side=tk.LEFT, padx=(2,5))
+        ttk.Separator(self.crop_hbox, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        # --- セクション 3: 解像度設定 ---
+        sec3 = tk.Frame(self.crop_hbox)
+        sec3.pack(side=tk.LEFT, padx=5, fill=tk.Y)
+        tk.Label(sec3, text="解像度:").pack(side=tk.LEFT, padx=(0,5))
+        self.ratio_var = tk.StringVar(value=self.aspect_options[0])
+        # 2段分の高さを持つ Lock ボタン (正方形)
+        self.btn_lock_res = tk.Button(sec3, text="🔓", width=5, font=("Consolas", 12, "bold"), bg=self.theme.get("button_unlocked_bg"), command=self.toggle_resolution_lock)
+        self.btn_lock_res.pack(side=tk.LEFT, fill=tk.Y, padx=(0,5))
         self.add_tooltip(self.btn_lock_res, "解像度・アスペクト比をロック (移動は可能)")
 
-        # 比率選択
-        self.ratio_var = tk.StringVar(value=self.aspect_options[0])
-        self.ratio_optionmenu = tk.OptionMenu(size_ctrl, self.ratio_var, *self.aspect_options)
-        self.ratio_optionmenu.pack(side=tk.LEFT, padx=(4,2))
-
+        # 比率 / プリセット選択のペア
+        p_aspect = tk.Frame(sec3)
+        p_aspect.pack(side=tk.LEFT, padx=5)
+        self.ratio_optionmenu = tk.OptionMenu(p_aspect, self.ratio_var, *self.aspect_options)
+        self.ratio_optionmenu.config(width=10, font=("Meiryo UI", 9))
+        self.ratio_optionmenu.pack(side=tk.TOP, fill=tk.X)
+        self.add_tooltip(self.ratio_optionmenu, "特定のアスペクト比に固定・指定")
         self.resolution_var = tk.StringVar(value="カスタム")
-        self.resolution_optionmenu = tk.OptionMenu(size_ctrl, self.resolution_var, "カスタム")
-        self.resolution_optionmenu.pack(side=tk.LEFT, padx=2)
+        self.resolution_optionmenu = tk.OptionMenu(p_aspect, self.resolution_var, "カスタム")
+        self.resolution_optionmenu.config(width=10, font=("Meiryo UI", 9))
+        self.resolution_optionmenu.pack(side=tk.TOP, fill=tk.X, pady=(2,0))
+        self.add_tooltip(self.resolution_optionmenu, "よく使う解像度プリセットを選択")
         self.ratio_var.trace_add('write', lambda *args: self.update_resolution_menu())
 
-        # 幅入力
-        tk.Label(size_ctrl, text="幅:").pack(side=tk.LEFT, padx=5)
-        self.entry_crop_w = tk.Entry(
-            size_ctrl, width=8, font=("Consolas", 12), justify="center")
-        self.entry_crop_w.insert(0, "200")
-        self.entry_crop_w.pack(side=tk.LEFT, padx=2)
-        self.entry_crop_w.bind(
-            "<Return>", lambda e: self.update_crop_from_entries())
-        self.entry_crop_w.bind(
-            "<FocusOut>", lambda e: self.update_crop_from_entries())
-        self.add_tooltip(self.entry_crop_w, "出力される画像の幅 (ピクセル)")
+        # 幅 / 高 のペア
+        p_size = tk.Frame(sec3)
+        p_size.pack(side=tk.LEFT, fill=tk.Y, expand=True)
 
-        # 高さ入力
-        tk.Label(size_ctrl, text="高:").pack(side=tk.LEFT, padx=5)
-        self.entry_crop_h = tk.Entry(
-            size_ctrl, width=8, font=("Consolas", 12), justify="center")
-        self.entry_crop_h.insert(0, "170")
-        self.entry_crop_h.pack(side=tk.LEFT, padx=2)
-        self.entry_crop_h.bind(
-            "<Return>", lambda e: self.update_crop_from_entries())
-        self.entry_crop_h.bind(
-            "<FocusOut>", lambda e: self.update_crop_from_entries())
+        # 上段: 幅
+        f4a = tk.Frame(p_size)
+        f4a.pack(side=tk.TOP, fill=tk.X, expand=True)
+        tk.Label(f4a, text="幅:", width=2).pack(side=tk.LEFT)
+        self.entry_crop_w = tk.Entry(f4a, width=6, font=("Consolas", 11), justify="center")
+        self.entry_crop_w.pack(side=tk.LEFT)
+        self.entry_crop_w.bind("<Return>", lambda e: self.update_crop_from_entries())
+        self.entry_crop_w.bind("<FocusOut>", lambda e: self.update_crop_from_entries())
+        self.add_tooltip(self.entry_crop_w, "出力される画像の幅 (ピクセル)")
+        # 下段: 高
+        f4b = tk.Frame(p_size)
+        f4b.pack(side=tk.TOP, fill=tk.X, expand=True, pady=(2,0))
+        tk.Label(f4b, text="高:", width=2).pack(side=tk.LEFT)
+        self.entry_crop_h = tk.Entry(f4b, width=6, font=("Consolas", 11), justify="center")
+        self.entry_crop_h.pack(side=tk.LEFT)
+        self.entry_crop_h.bind("<Return>", lambda e: self.update_crop_from_entries())
+        self.entry_crop_h.bind("<FocusOut>", lambda e: self.update_crop_from_entries())
         self.add_tooltip(self.entry_crop_h, "出力される画像の高さ (ピクセル)")
 
-        # プリセット保存/削除ボタン
-        self.btn_save_preset = tk.Button(size_ctrl, text="プリセット保存", command=self.add_resolution_preset, bg=self.theme.get("button_reload_bg"))
-        self.btn_save_preset.pack(side=tk.LEFT, padx=2)
+        # プリセット操作 (保存 / 削除) のペア
+        p_presets = tk.Frame(sec3)
+        p_presets.pack(side=tk.LEFT, padx=5)
+        self.btn_save_preset = tk.Button(p_presets, text="プリセット保存", command=self.add_resolution_preset, bg=self.theme.get("button_reload_bg"), font=("Meiryo UI", 9))
+        self.btn_save_preset.pack(side=tk.TOP, fill=tk.X)
         self.add_tooltip(self.btn_save_preset, "現在の解像度をプリセットに追加")
-        
-        self.btn_delete_preset = tk.Button(size_ctrl, text="プリセット削除", command=self.delete_resolution_preset, bg=self.theme.get("button_undo_bg"))
-        self.btn_delete_preset.pack(side=tk.LEFT, padx=2)
+        self.btn_delete_preset = tk.Button(p_presets, text="プリセット削除", command=self.delete_resolution_preset, bg=self.theme.get("button_undo_bg"), font=("Meiryo UI", 9))
+        self.btn_delete_preset.pack(side=tk.TOP, fill=tk.X, pady=(2,0))
         self.add_tooltip(self.btn_delete_preset, "選択中のプリセットを削除")
 
         
 
-        # 5. 出力グループ（設定、PNG、動画/GIF）の3列構成
+        # 5. 出力グループ（設定、PNG、動画/GIF）の3列構成 (1:2:1 の比率で配置)
         output_panel = tk.LabelFrame(control_frame, text="エクスポート", bd=1, relief=tk.SOLID, padx=5, pady=5)
         output_panel.pack(fill=tk.X, padx=10, pady=5)
+        output_panel.columnconfigure(0, weight=1) # 操作の軌跡
+        output_panel.columnconfigure(1, weight=0) # セパレータ
+        output_panel.columnconfigure(2, weight=2) # 静止画出力
+        output_panel.columnconfigure(3, weight=0) # セパレータ
+        output_panel.columnconfigure(4, weight=1) # 動画出力
+        output_panel.rowconfigure(0, weight=1)    # 縦方向の伸縮（はみ出し防止）
 
-        # 列1: 設定
-        col_settings = tk.LabelFrame(output_panel, text="設定", relief=tk.FLAT)
-        col_settings.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+        # 列1: 操作の軌跡 (旧 設定)
+        col_settings = tk.LabelFrame(output_panel, text="操作の軌跡", relief=tk.FLAT)
+        col_settings.grid(row=0, column=0, sticky="nsew", padx=(2, 5))
 
-        self.check_prev_next = tk.BooleanVar(value=self.global_config.get("check_prev_next", True))
-        tk.Checkbutton(col_settings, text="前後不一致で除外", variable=self.check_prev_next).pack(anchor=tk.W)
-        self.check_duplicate = tk.BooleanVar(value=self.global_config.get("check_duplicate", True))
-        tk.Checkbutton(col_settings, text="直前重複で除外", variable=self.check_duplicate).pack(anchor=tk.W)
-        
-        # マウス軌跡チェック
-        self.chk_traj = tk.Checkbutton(col_settings, text="マウス軌跡を表示", variable=self.show_trajectory_var, command=self.update_canvas_overlay)
-        self.chk_traj.pack(anchor=tk.W)
+        # セパレータ1
+        ttk.Separator(output_panel, orient=tk.VERTICAL).grid(row=0, column=1, sticky="ns", padx=5)
+
+        # 左側コンテナ（チェックボックス群）
+        left_overlay = tk.Frame(col_settings, bg="#f5f5f5")
+        left_overlay.pack(side=tk.LEFT, fill=tk.Y)
+
+        self.chk_trajectory = tk.Checkbutton(left_overlay, text="マウスポインタを表示", variable=self.show_trajectory_var, command=self.update_canvas_image, bg="#f5f5f5")
+        self.chk_trajectory.pack(anchor=tk.W)
+
+        self.chk_sub = tk.Checkbutton(left_overlay, text="マウス・キー入力字幕を表示", variable=self.show_subtitle_var, command=self.update_canvas_image, bg="#f5f5f5")
+        self.chk_sub.pack(anchor=tk.W)
+
+        # 埋め込みチェックボックス
+        self.chk_embed = tk.Checkbutton(left_overlay, text="字幕等を動画へ埋め込み", variable=self.embed_overlay_var, bg="#f5f5f5")
+        self.chk_embed.pack(anchor=tk.W)
+
+        # 右側: 詳細設定ボタン (高さは操作の軌跡いっぱいに)
+        self.btn_overlay_settings = tk.Button(col_settings, text="⚙️ 詳細設定", command=self.open_overlay_settings, font=top_font, bg="#FFD700")
+        self.btn_overlay_settings.pack(side=tk.RIGHT, padx=5, fill=tk.BOTH, expand=True, pady=2)
+
 
         # 列2: 静止画出力
         col_png = tk.LabelFrame(output_panel, text="静止画出力", relief=tk.FLAT)
-        col_png.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+        col_png.grid(row=0, column=2, sticky="nsew", padx=5)
 
-        self.btn_copy_image = tk.Button(col_png, text="🖼️ クリップボードにコピー", command=self.copy_crop_to_clipboard, bg=self.theme.get("button_copy_bg"), height=2)
-        self.btn_copy_image.pack(fill=tk.X, pady=2)
+        # セパレータ2
+        ttk.Separator(output_panel, orient=tk.VERTICAL).grid(row=0, column=3, sticky="ns", padx=5)
+
+        # 3分割用フレーム
+        cp_split_frame = tk.Frame(col_png)
+        cp_split_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 左端: クリップボードコピー
+        left_f = tk.Frame(cp_split_frame)
+        left_f.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        self.btn_copy_image = tk.Button(left_f, text="📷️ 表示内容をCOPY", command=self.copy_crop_to_clipboard, bg=self.theme.get("button_copy_bg"), cursor="hand2", font=top_font)
+        self.btn_copy_image.pack(fill=tk.BOTH, expand=True, pady=2, padx=2)
         self.add_tooltip(self.btn_copy_image, "Ctrl+C: 現在のフレームをクリップボードにコピー")
 
-        # 圧縮と連番保存を横並びに
-        png_btns_f = tk.Frame(col_png)
-        png_btns_f.pack(fill=tk.X, pady=2)
+        # 中央: 除外チェックボックス + 圧縮設定
+        mid_f = tk.Frame(cp_split_frame)
+        mid_f.pack(side=tk.LEFT, fill=tk.X, expand=False, padx=5)
 
-        tk.Label(png_btns_f, text="PNG圧縮:").pack(side=tk.LEFT)
+        self.check_prev_next = tk.BooleanVar(value=self.global_config.get("check_prev_next", True))
+        tk.Checkbutton(mid_f, text="前後不一致で除外", variable=self.check_prev_next).pack(anchor=tk.W)
+        self.check_duplicate = tk.BooleanVar(value=self.global_config.get("check_duplicate", True))
+        tk.Checkbutton(mid_f, text="直前重複で除外", variable=self.check_duplicate).pack(anchor=tk.W)
+
+        # 圧縮設定
+        compression_f = tk.Frame(mid_f)
+        compression_f.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(compression_f, text="PNG圧縮:").pack(side=tk.LEFT)
         self.compression_var = tk.StringVar(value=str(self.png_compression))
-        self.compression_spinbox = tk.Spinbox(png_btns_f, from_=0, to=9, increment=1, width=3, textvariable=self.compression_var, command=self.change_compression)
+        self.compression_spinbox = tk.Spinbox(compression_f, from_=0, to=9, increment=1, width=3, textvariable=self.compression_var, command=self.change_compression)
         self.compression_spinbox.pack(side=tk.LEFT, padx=3)
 
-        self.btn_export_png = tk.Button(png_btns_f, text="PNG連番保存", command=self.export_png, bg=self.theme.get("button_export_bg"))
-        self.btn_export_png.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
+        # 右端: PNG保存ボタン (左端のコピーボタンと同じ比率で伸縮させる)
+        right_f = tk.Frame(cp_split_frame)
+        right_f.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.btn_export_png = tk.Button(right_f, text="🖼️ PNG連番保存", command=self.export_png, bg=self.theme.get("button_export_bg"), cursor="hand2", font=top_font)
+        self.btn_export_png.pack(fill=tk.BOTH, expand=True, pady=2, padx=2)
         self.add_tooltip(self.btn_export_png, "指定範囲をPNG連番で保存")
 
         # 列3: 動画出力
         col_video = tk.LabelFrame(output_panel, text="動画出力", relief=tk.FLAT)
-        col_video.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-
-        self.btn_export_video = tk.Button(col_video, text="MP4 動画保存", command=self.export_video, bg=self.theme.get("button_video_bg"), height=2)
-        self.btn_export_video.pack(side=tk.TOP, fill=tk.X, pady=2)
-        self.add_tooltip(self.btn_export_video, "選択範囲をMP4動画としてエクスポート (V)")
+        col_video.grid(row=0, column=4, sticky="nsew", padx=(5, 2))
         
-        self.btn_export_gif = tk.Button(col_video, text="GIF アニメ保存", command=self.export_gif, bg=self.theme.get("button_gif_bg"))
-        self.btn_export_gif.pack(side=tk.TOP, fill=tk.X, pady=2)
-        self.add_tooltip(self.btn_export_gif, "選択範囲をGIFアニメとしてエクスポート (G)")
+        # 保存ボタン容器 (高さを揃えるため fill=tk.Y。内部は expand=False にしてスリム化)
+        video_btn_frame = tk.Frame(col_video)
+        video_btn_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.btn_export_video = tk.Button(video_btn_frame, text="🎞️ MP4 動画保存", command=self.export_video, bg=self.theme.get("button_video_bg"), font=top_font)
+        self.btn_export_video.pack(side=tk.TOP, fill=tk.X, expand=False, pady=1)
+        self.add_tooltip(self.btn_export_video, "選択範囲をMP4動画としてエクスポート")
+        
+        self.btn_export_gif = tk.Button(video_btn_frame, text="🖼️ GIF アニメ保存", command=self.export_gif, bg=self.theme.get("button_gif_bg"), font=top_font)
+        self.btn_export_gif.pack(side=tk.TOP, fill=tk.X, expand=False, pady=1)
+        self.add_tooltip(self.btn_export_gif, "選択範囲をGIFアニメとしてエクスポート")
 
         # 全ボタンの activebackground を背景色に設定して色戻りを修正
         self._fix_all_button_active_colors(output_panel)
@@ -655,7 +762,6 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         if config.get("window_maximized", False):
             self.root.state('zoomed')
     
-
     def save_window_geometry(self):
         """ウィンドウの状態を保存"""
         config = load_global_config()
@@ -721,6 +827,10 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             self.pingpong_var.set(self.global_config.get("play_pingpong", False))
         if hasattr(self, 'show_trajectory_var'):
             self.show_trajectory_var.set(self.global_config.get("show_trajectory", True))
+        if hasattr(self, 'show_subtitle_var'):
+            self.show_subtitle_var.set(self.global_config.get("show_subtitle", True))
+        if hasattr(self, 'embed_overlay_var'):
+            self.embed_overlay_var.set(self.global_config.get("embed_overlay", False))
         
         # 現在開いている動画があれば再読み込み、なければ最後に開いた動画を読み込む
         if self.video_filepath and os.path.exists(self.video_filepath):
@@ -738,7 +848,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         """動画ファイルを読み込み、個別設定を反映させる"""
         if self.cap:
             self.cap.release()
-            
+        
         self.cap = cv2.VideoCapture(video_file)
         if not self.cap.isOpened():
             return False
@@ -763,13 +873,19 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # 動画個別設定の読み込み
         per_video_settings = load_video_settings(self.video_filepath)
 
-
         if per_video_settings:
             crop_rect_data = per_video_settings.get('crop_rect', {})
             self.start_time = float(per_video_settings.get('start_time', 0))
             self.end_time = float(per_video_settings.get('end_time', self.duration))
+            self.end_time = float(per_video_settings.get('end_time', self.duration))
             # 現在の再生位置を復元（保存されていない場合は開始位置）
             self.current_time = float(per_video_settings.get('current_time', self.start_time))
+            
+            # 枠外選択設定の復元
+            allow_oversize = per_video_settings.get('allow_oversize', False)
+            if hasattr(self, 'allow_oversize_var'):
+                self.allow_oversize_var.set(allow_oversize)
+            
             if crop_rect_data:
                 # 設定ファイルが古い（640x360基準）か新しい（ピクセル基準）かを簡易判定
                 # 幅が640以下の場合は古い可能性があるが、ユーザーが小さいクロップを指定している場合と区別が難しい。
@@ -838,10 +954,15 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         config["play_loop"] = self.loop_var.get() if hasattr(self, 'loop_var') else False
         config["play_pingpong"] = self.pingpong_var.get() if hasattr(self, 'pingpong_var') else False
         config["show_trajectory"] = self.show_trajectory_var.get() if hasattr(self, 'show_trajectory_var') else True
+        config["show_subtitle"] = self.show_subtitle_var.get() if hasattr(self, 'show_subtitle_var') else True
+        config["embed_overlay"] = self.embed_overlay_var.get() if hasattr(self, 'embed_overlay_var') else False
 
-        # 古いwindow_geometryフィールドを削除
-        if "window_geometry" in config:
-            del config["window_geometry"]
+        # アスペクト比オプション（UI で選べる固定リスト）
+        config["aspect_options"] = self.aspect_options
+        
+        # 詳細設定ダイアログ等で変更された theme (mouse_overlay, input_overlay等) を保持
+        if hasattr(self, 'global_config') and "theme" in self.global_config:
+            config["theme"] = self.global_config["theme"]
 
         save_global_config(config)
 
@@ -857,7 +978,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             self.crop_rect,
             self.start_time,
             self.end_time,
-            self.current_time
+            self.current_time,
+            allow_oversize=self.allow_oversize_var.get()
         )
 
         if per_video_success:
@@ -872,6 +994,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         menu.delete(0, tk.END)
         # まずカスタム項目
         menu.add_command(label="カスタム", command=lambda v="カスタム": self.resolution_var.set(v))
+        # 全画面項目
+        menu.add_command(label="全画面", command=lambda v="全画面": (self.resolution_var.set(v), self.apply_resolution_preset(v)))
 
         # 比率フィルタが指定されていれば絞り込む
         selected_ratio = None
@@ -984,7 +1108,8 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         # 保存
         try:
             if imwrite_jp(out_path, cropped):
-                messagebox.showinfo("Success", f"保存しました:\n{out_name}")
+                if messagebox.askyesno("Success", f"保存しました:\n{out_name}\n\n保存フォルダを開きますか？"):
+                    open_folder_with_selection(out_path)
             else:
                 messagebox.showerror("Error", "保存に失敗しました。")
         except Exception as e:
@@ -1307,11 +1432,92 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                 return
             rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
             pil = Image.fromarray(rgb)
+            
+            # 操作履歴のオーバーレイを描画
+            history_manager = overlay_utils.InputHistoryManager()
+            self._draw_overlay_on_image(pil, self.current_time, history_manager, 0, vx1, vy1)
+
             ok = self._copy_image_to_clipboard(pil)
-            if not ok:
+            if ok:
+                # 視覚的なフィードバック（フラッシュ＆メッセージ）
+                self._show_copy_feedback()
+            else:
                 messagebox.showerror('Error', 'クリップボードへ画像をコピーできませんでした')
         except Exception as e:
             messagebox.showerror('Error', f'コピーに失敗しました:\n{e}')
+
+    def _show_copy_feedback(self):
+        """コピー時のフラッシュ効果とメッセージ表示を行う（改善版）."""
+        # 1. クロップ範囲のキャンバス座標を計算
+        x1, y1, x2, y2 = self.crop_rect
+        cx1 = x1 * self.canvas_scale_x + self.canvas_offset_x
+        cy1 = y1 * self.canvas_scale_y + self.canvas_offset_y
+        cx2 = x2 * self.canvas_scale_x + self.canvas_offset_x
+        cy2 = y2 * self.canvas_scale_y + self.canvas_offset_y
+
+        # 2. フラッシュ（白い矩形）- 時間を 200ms に延長
+        flash_id = self.canvas.create_rectangle(
+            cx1, cy1, cx2, cy2, fill="white", outline="", stipple="gray50" if sys.platform != "win32" else ""
+        )
+        self.root.after(200, lambda: self.canvas.delete(flash_id))
+        
+        # 3. メッセージ表示
+        mx = (cx1 + cx2) / 2
+        my = (cy1 + cy2) / 2
+        
+        # モダンなフォント設定
+        font_main = ("Segoe UI", 24, "bold")
+        font_outline = ("Segoe UI", 24, "bold")
+        
+        # 縁取りテキスト (黒)
+        shadows = []
+        for dx, dy in [(-2,-2), (2,-2), (-2,2), (2,2), (0,-2), (0,2), (-2,0), (2,0)]:
+            s_id = self.canvas.create_text(
+                mx + dx, my + dy, text="コピーしたよ", fill="black", font=font_outline
+            )
+            shadows.append(s_id)
+            
+        # メインテキスト (白)
+        text_id = self.canvas.create_text(
+            mx, my, text="コピーしたよ", fill="white", font=font_main
+        )
+
+        # 4. 滑らかなフェードアウト (0.5秒)
+        # Tkinterの色を段階的に透明（背景色）に近づける
+        fade_steps = 10
+        fade_duration = 500 # ms
+        
+        def get_fade_color(step: int, start_rgb: tuple, end_rgb: tuple) -> str:
+            r = int(start_rgb[0] + (end_rgb[0] - start_rgb[0]) * (step / fade_steps))
+            g = int(start_rgb[1] + (end_rgb[1] - start_rgb[1]) * (step / fade_steps))
+            b = int(start_rgb[2] + (end_rgb[2] - start_rgb[2]) * (step / fade_steps))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        # キャンバス背景色を取得（色の収束先）
+        bg_hex = self.theme.get("canvas_bg", "#f5f5f5")
+        bg_rgb = tuple(int(bg_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+        
+        white_rgb = (255, 255, 255)
+        black_rgb = (0, 0, 0)
+
+        def animate_fade(step=0):
+            if step > fade_steps:
+                self.canvas.delete(text_id)
+                for s in shadows: self.canvas.delete(s)
+                return
+            
+            # 文字の色を背景色に近づける
+            new_text_color = get_fade_color(step, white_rgb, bg_rgb)
+            new_shadow_color = get_fade_color(step, black_rgb, bg_rgb)
+            
+            self.canvas.itemconfig(text_id, fill=new_text_color)
+            for s in shadows:
+                self.canvas.itemconfig(s, fill=new_shadow_color)
+            
+            self.root.after(int(fade_duration / fade_steps), lambda: animate_fade(step + 1))
+
+        # 少し待ってからフェード開始
+        self.root.after(100, animate_fade)
 
     def show_shortcuts(self):
         # ショートカット一覧を表示（既に開いていれば再利用して前面に移動）
@@ -1379,6 +1585,26 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         tx = rx + (rw // 2) - (w // 2)
         ty = ry + (rh // 2) - (h // 2)
         top.geometry(f"+{tx}+{ty}")
+
+    def open_overlay_settings(self):
+        """詳細設定ダイアログを開く"""
+        try:
+            from overlay_settings_dialog import InputOverlaySettingsDialog
+            InputOverlaySettingsDialog(self, self.global_config, self.on_overlay_settings_update)
+        except ImportError:
+            messagebox.showinfo("Info", "詳細設定ダイアログの実装はまだです")
+
+    def on_overlay_settings_update(self):
+        """詳細設定ダイアログからの更新を受け取る"""
+        # テーマ設定を更新
+        self.theme = self.global_config.get("theme", {})
+        
+        # テーマ依存のパラメータを再設定
+        self.HANDLE_SIZE = self.theme.get("handle_size", 8)
+        self.EDGE_MARGIN = self.theme.get("edge_margin", 20)
+        
+        # キャンバス再描画
+        self.update_canvas_image()
 
     def update_crop_entries(self):
         """クロップ矩形からサイズ入力フィールドを更新"""
@@ -1481,6 +1707,33 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         """プリセット解像度を適用（self.resolution_presets を参照）"""
         if self.lock_var.get():
             return
+
+        # 全画面対応
+        if preset_name == "全画面":
+            w = getattr(self, "vid_w", self.CANVAS_W)
+            h = getattr(self, "vid_h", self.CANVAS_H)
+            # 変更は undo 履歴に保存
+            try:
+                self.push_crop_history()
+            except Exception:
+                pass
+            
+            # クロップ矩形を全画面に設定
+            self.crop_rect = [0, 0, w, h]
+            
+            # 入力欄も更新
+            self.entry_crop_x.delete(0, tk.END)
+            self.entry_crop_x.insert(0, "0")
+            self.entry_crop_y.delete(0, tk.END)
+            self.entry_crop_y.insert(0, "0")
+            self.entry_crop_w.delete(0, tk.END)
+            self.entry_crop_w.insert(0, str(w))
+            self.entry_crop_h.delete(0, tk.END)
+            self.entry_crop_h.insert(0, str(h))
+            
+            self._sync_crop_rect_ui()
+            return
+
         presets = self.resolution_presets or {}
         if preset_name in presets:
             pair = presets[preset_name]
@@ -1509,6 +1762,10 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         if size_locked and move_locked:
             return
             
+        # ドラッグ中・リサイズ中はEntryからの更新を無視する（ループ防止）
+        if getattr(self, 'dragging_rect', False) or getattr(self, 'resizing_rect', False):
+            return
+
         try:
             cur_x, cur_y, cur_x2, cur_y2 = self.crop_rect
             cur_w = cur_x2 - cur_x
@@ -1821,6 +2078,10 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
         # リサイズ済みフレームを作成（ズーム後のサイズ）
         img = Image.fromarray(rgb).resize((rw, rh), Image.Resampling.LANCZOS)
+        
+        # マウス軌跡のオーバーレイ描画
+        self.update_canvas_overlay(img)
+
         self.tk_img = ImageTk.PhotoImage(img)
 
         # パンオフセットを加味してキャンバス内に配置
@@ -1847,8 +2108,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             int(self.crop_rect[2] * self.canvas_scale_x) + offset_x,
             int(self.crop_rect[3] * self.canvas_scale_y) + offset_y
         ]
-        self.canvas.coords(self.rect_id, *scaled_rect)
-
+        
         # 矩形の外見(色、太さ、線種)を更新
         try:
             # テーマ設定の取得
@@ -1885,15 +2145,26 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                 # tkinter の破線引数として適切な形式に変換
                 linestyle_arg = tuple(linestyle) if isinstance(linestyle, (list, tuple)) else linestyle
 
+            # 描画位置の調整（枠線を外側に広げる）
+            # 太さが太くなっても内側（映像エリア）には被らないように、
+            # 枠線の中心線を外側にずらす。
+            # offset = 1 (1px gap) + width / 2 (center of the line)
+            offset = 1.0 + width / 2.0
+            draw_rect = [
+                scaled_rect[0] - offset,
+                scaled_rect[1] - offset,
+                scaled_rect[2] + offset,
+                scaled_rect[3] + offset
+            ]
+
+            self.canvas.coords(self.rect_id, *draw_rect)
             self.canvas.itemconfig(self.rect_id, width=width, outline=linecolor, dash=linestyle_arg)
         except Exception:
             pass
 
         # 角マーカー（ハンドル）を描画/更新する
+        # ハンドルは論理的な角（scaled_rect）に合わせて配置する
         self._update_corner_handles(self._get_corner_coords(scaled_rect))
-        
-        # マウス軌跡のオーバーレイ描画
-        self.update_canvas_overlay()
 
     # ------------------ キャンバスリサイズ処理 ------------------
     def on_canvas_resize(self, event=None):
@@ -1922,7 +2193,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         state = tk.HIDDEN if lock_res else tk.NORMAL
         
         # デフォルトのハンドルの色（通常時: 白）
-        handle_color = "#FFFFFF"
+        handle_color = self.theme.get("handle_color", "#FFFFFF")
         
         for i, rect in enumerate(corners):
             if self.corner_ids[i] is None:
@@ -1934,7 +2205,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
     def _get_corner_coords(self, scaled_rect: list[int]) -> list[tuple[int, int, int, int]]:
         """スケール後の矩形座標から4隅のハンドル矩形座標を計算."""
         cx1, cy1, cx2, cy2 = scaled_rect
-        size = self.HANDLE_SIZE
+        size = self.theme.get("handle_size", 8)
         half = size // 2
         return [
             (cx1 - half, cy1 - half, cx1 + half, cy1 + half),
@@ -1949,7 +2220,23 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             self.update_canvas_image()
         else:
             scaled_rect = self._scaled_rect_from_crop()
-            self.canvas.coords(self.rect_id, *scaled_rect)
+            
+            # ここでも update_canvas_image と同様に枠線を外側に広げる計算を行う
+            try:
+                # 現在の幅を取得（floatで返ってくる可能性があるため安全に処理）
+                current_width = float(self.canvas.itemcget(self.rect_id, "width"))
+            except Exception:
+                current_width = float(self.theme.get("crop_width", 1))
+
+            offset = 1.0 + current_width / 2.0
+            draw_rect = [
+                scaled_rect[0] - offset,
+                scaled_rect[1] - offset,
+                scaled_rect[2] + offset,
+                scaled_rect[3] + offset
+            ]
+            
+            self.canvas.coords(self.rect_id, *draw_rect)
             self._update_corner_handles(self._get_corner_coords(scaled_rect))
         self.update_crop_entries()
 
@@ -1968,43 +2255,114 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                     for line in f:
                         parts = line.strip().split("\t")
                         if len(parts) >= 4:
-                            # timestamp, frame, x, y
+                            # timestamp, frame, x, y, click, keys
                             try:
                                 t = float(parts[0])
                                 x = int(parts[2])
                                 y = int(parts[3])
-                                self.trajectory_data.append((t, x, y))
+                                click = parts[4] if len(parts) > 4 else "None"
+                                keys = parts[5] if len(parts) > 5 else "None"
+                                self.trajectory_data.append((t, x, y, click, keys))
                             except:
                                 pass
             except Exception as e:
                 print(f"TSV読込エラー: {e}")
 
-    def update_canvas_overlay(self):
+    def open_current_tsv(self):
+        """動画と同名の .tsv ファイルを既定のエディタで開く."""
+        if not self.video_filepath:
+            messagebox.showinfo("Info", "動画が選択されていません")
+            return
+        
+        tsv_path = os.path.splitext(self.video_filepath)[0] + ".tsv"
+        if not os.path.exists(tsv_path):
+            messagebox.showinfo("Info", f"TSVファイルが見つかりません:\n{tsv_path}")
+            return
+        
+        open_file(tsv_path)
+
+    def update_canvas_overlay(self, img):
         """マウス軌跡等のオーバーレイを表示中のフレームに合わせて描画."""
-        self.canvas.delete("overlay")
         if not self.show_trajectory_var.get() or not self.trajectory_data:
             return
 
-        # 現在の時刻に近いデータを検索
-        relevant_data = None
-        for t, x, y in self.trajectory_data:
-            if abs(t - self.current_time) < (1.0 / self.fps): # 1フレーム以内
-                relevant_data = (x, y)
+        # --- 1. マウス軌跡のオーバーレイ (現在の時刻に最も近いデータ) ---
+        mouse_data = None
+        current_row_idx = -1
+        for i, row in enumerate(self.trajectory_data):
+            t, x, y, click, keys = row
+            if abs(t - self.current_time) < (1.0 / self.fps):
+                mouse_data = row
+                current_row_idx = i
                 break
         
-        if relevant_data:
-            x, y = relevant_data
-            try:
-                cx = x * self.canvas_scale_x + self.canvas_offset_x
-                cy = y * self.canvas_scale_y + self.canvas_offset_y
-                
-                # ポインタを描画 (赤丸)
-                r = 6
-                self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r, outline="red", width=2, tags="overlay")
-                # 中心点
-                self.canvas.create_oval(cx-2, cy-2, cx+2, cy+2, fill="red", tags="overlay")
-            except:
-                pass
+        if mouse_data:
+            t_curr, x, y, click, keys = mouse_data
+            
+            # --- 波紋ロジック ---
+            ripple_age = 0.0
+            ripple_type = ""
+            lookback_sec = 0.5
+            if current_row_idx > 0:
+                for i in range(current_row_idx, 0, -1):
+                    t_c, c_c = self.trajectory_data[i][0], self.trajectory_data[i][3]
+                    t_p, c_p = self.trajectory_data[i-1][0], self.trajectory_data[i-1][3]
+                    if t_curr - t_c > lookback_sec: break
+                    for btn_char, btn_name in [("L", "left"), ("R", "right"), ("M", "middle")]:
+                        if btn_char in c_p and btn_char not in c_c:
+                            ripple_type = btn_name
+                            ripple_age = t_curr - t_c
+                            break
+                    if ripple_type: break
+
+            overlay_utils.draw_mouse_overlay(
+                img, x, y, click, 
+                self.canvas_scale_x, self.canvas_scale_y, 
+                self.theme,
+                ripple_age=ripple_age,
+                ripple_type=ripple_type
+            )
+
+        # --- 2. 入力履歴オーバーレイ (ONの場合のみ) ---
+        if self.show_subtitle_var.get():
+            # 字幕用テキスト生成 (overlay_utilsの共通ロジックを使用)
+            display_text = overlay_utils.get_input_display_text(click, keys)
+            
+            # 履歴マネージャを更新
+            self.input_history_manager.update(self.current_time, display_text)
+            
+            # クロップ範囲のみに字幕を出すための描画範囲計算
+            # キャンバス上の画像表示領域内におけるクロップ矩形の相対座標
+            cx1, cy1, cx2, cy2 = self.crop_rect
+            
+            # 拡大率（現在の拡大表示を考慮）
+            z = self.image_zoom
+            # キャンバス座標系への変換
+            # NOTE: self.crop_rect はビデオ本来の座標 [0, vid_w]
+            # キャンバス上の画像は vid_w * self.canvas_scale_x * z に拡大されている
+            sx = self.canvas_scale_x * z
+            sy = self.canvas_scale_y * z
+            
+            # 描画対象の矩形範囲 (キャンバス画像内の相対座標)
+            target_rect = [
+                int(cx1 * sx),
+                int(cy1 * sy),
+                int(cx2 * sx),
+                int(cy2 * sy)
+            ]
+
+            # 表示すべき入力を取得
+            fade_duration = self.theme.get("input_overlay", {}).get("fade_duration", 1.0)
+            active_inputs = self.input_history_manager.get_active_inputs(self.current_time, fade_duration)
+            
+            # 描画
+            if active_inputs:
+                overlay_utils.draw_input_overlay(
+                    img, active_inputs,
+                    sx, sy,
+                    self.theme,
+                    target_rect=target_rect
+                )
 
     # ------------------ シークバーとマーカー ------------------
     def get_x(self, t):
@@ -2112,7 +2470,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
     # クロップ矩形のマウス操作は CropHandlerMixin のメソッドを使用します
 
     def on_mouse_down(self, e):
-        edges = self.near_edge(e.x, e.y, m=self.EDGE_MARGIN)
+        edges = self.near_edge(e.x, e.y, m=self.theme.get("edge_margin", 20))
         if any(edges.values()):
             if self.lock_var.get():
                 # ロック中はリサイズ不可だが、内側ならドラッグ開始（移動のみ許可）
@@ -2289,7 +2647,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                 nx = round(nx / 10) * 10
                 ny = round(ny / 10) * 10
                 
-            self.crop_rect = self.clamp_rect_canvas([nx, ny, nx+w, ny+h])
+            self.crop_rect = self.clamp_rect_move(nx, ny, w, h)
 
             # スケール後の座標で矩形を描画
             scaled_rect = [
@@ -2348,7 +2706,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
             h = self.crop_rect[3] - self.crop_rect[1]
             nx = img_x - self.drag_offset[0]
             ny = img_y - self.drag_offset[1]
-            self.crop_rect = self.clamp_rect_canvas([nx, ny, nx+w, ny+h])
+            self.crop_rect = self.clamp_rect_move(nx, ny, w, h)
 
             scaled_rect = self._scaled_rect_from_crop()
             self.canvas.coords(self.rect_id, *scaled_rect)
@@ -2445,7 +2803,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
     def on_canvas_motion(self, e):
         # マウス移動時にカーソルを変更し、ハンドルをハイライトする
-        edges = self.near_edge(e.x, e.y, m=10)  # ハイライト用は小さめの判定
+        edges = self.near_edge(e.x, e.y, m=self.theme.get("edge_margin", 20))  # ハイライト判定をon_mouse_downと統一
         inside = self.inside_rect(e.x, e.y)
         
         # ホバー状態の更新

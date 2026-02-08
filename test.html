@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VideoChulip Logo Mockup</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;700&display=swap');
+
+        body {
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background: #f8f9fa;
+            font-family: 'Outfit', sans-serif;
+        }
+
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            padding: 40px;
+            background: white;
+            border-radius: 30px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.05);
+        }
+
+        .logo-icon {
+            position: relative;
+            width: 100px;
+            height: 100px;
+            background: linear-gradient(135deg, #ff4e50 0%, #fc913a 100%);
+            border-radius: 24px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+            box-shadow: 0 10px 20px rgba(255, 78, 80, 0.3);
+        }
+
+        /* チューリップのモチーフ */
+        .tulip {
+            position: relative;
+            width: 60px;
+            height: 60px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .tulip-petal {
+            position: absolute;
+            width: 30px;
+            height: 50px;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 50% 50% 40% 40%;
+        }
+
+        .petal-left {
+            transform: rotate(-25deg) translateX(-12px);
+            opacity: 0.8;
+        }
+
+        .petal-right {
+            transform: rotate(25deg) translateX(12px);
+            opacity: 0.8;
+        }
+
+        .petal-center {
+            height: 55px;
+            z-index: 2;
+        }
+
+        /* 再生ボタン */
+        .play-button {
+            position: absolute;
+            z-index: 10;
+            width: 0;
+            height: 0;
+            border-top: 10px solid transparent;
+            border-bottom: 10px solid transparent;
+            border-left: 15px solid #ff4e50;
+            margin-left: 4px;
+        }
+
+        /* クロップ枠の角 */
+        .crop-mark {
+            position: absolute;
+            width: 15px;
+            height: 15px;
+            border: 3px solid rgba(255, 255, 255, 0.5);
+            z-index: 5;
+        }
+
+        .top-left {
+            top: 10px;
+            left: 10px;
+            border-right: none;
+            border-bottom: none;
+        }
+
+        .bottom-right {
+            bottom: 10px;
+            right: 10px;
+            border-left: none;
+            border-top: none;
+        }
+
+        .logo-text {
+            font-size: 48px;
+            font-weight: 700;
+            letter-spacing: -1px;
+            color: #2d3436;
+        }
+
+        .logo-text span {
+            color: #ff4e50;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="logo-container">
+        <div class="logo-icon">
+            <div class="crop-mark top-left"></div>
+            <div class="crop-mark bottom-right"></div>
+            <div class="tulip">
+                <div class="tulip-petal petal-left"></div>
+                <div class="tulip-petal petal-center"></div>
+                <div class="tulip-petal petal-right"></div>
+                <div class="play-button"></div>
+            </div>
+        </div>
+        <div class="logo-text">Video<span>Chulip</span></div>
+    </div>
+</body>
+
+</html>

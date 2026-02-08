@@ -87,14 +87,54 @@ class CropHandlerMixin:
         vw = getattr(self, "vid_w", self.CANVAS_W)
         vh = getattr(self, "vid_h", self.CANVAS_H)
 
-        if x1 < 0:
-            x1 = 0
-        if y1 < 0:
-            y1 = 0
-        if x1 + w > vw:
-            x1 = vw - w
-        if y1 + h > vh:
-            y1 = vh - h
+        if getattr(self, 'allow_oversize_var', None) and self.allow_oversize_var.get():
+             # 枠外選択許可時は動画解像度によるクランプを行わない
+             # ただし、あまりに遠くに行き過ぎないように緩和された制限を設ける（例えば解像度の3倍程度）
+             # ここではシンプルに、width/height の最小値だけ保証して座標制限は事実上外す
+             # (UI操作で戻ってこられる範囲ならOK)
+             limit_margin = 5000 # 画面外許容範囲
+             if x1 < -limit_margin: x1 = -limit_margin
+             if y1 < -limit_margin: y1 = -limit_margin
+             if x1 > vw + limit_margin: x1 = vw + limit_margin
+             if y1 > vh + limit_margin: y1 = vh + limit_margin
+             # x2, y2 は w, h から再計算されるので x1, y1 だけ見ればよいが念のため
+        else:
+            if x1 < 0:
+                x1 = 0
+            if y1 < 0:
+                y1 = 0
+            if x1 + w > vw:
+                x1 = vw - w
+            if y1 + h > vh:
+                y1 = vh - h
+                
+        return [int(x1), int(y1), int(x1 + w), int(y1 + h)]
+
+    def clamp_rect_move(self, x1: int, y1: int, w: int, h: int) -> list[int]:
+        """移動専用のクランプ処理（サイズ固定）.
+        
+        指定されたw, hを必ず維持し、位置のみを調整する。
+        """
+        # クランプ対象の最大値を動画解像度に変更（フォールバックでキャンバス）
+        vw = getattr(self, "vid_w", self.CANVAS_W)
+        vh = getattr(self, "vid_h", self.CANVAS_H)
+
+        allow_oversize = getattr(self, 'allow_oversize_var', None) and self.allow_oversize_var.get()
+
+        if allow_oversize:
+             limit_margin = 5000 # 画面外許容範囲
+             if x1 < -limit_margin: x1 = -limit_margin
+             if y1 < -limit_margin: y1 = -limit_margin
+             # x2 = x1 + w が vw + limit_margin を超えないようにする
+             if x1 + w > vw + limit_margin: x1 = (vw + limit_margin) - w
+             if y1 + h > vh + limit_margin: y1 = (vh + limit_margin) - h
+        else:
+            # キャンバス（動画）内に収める
+            if x1 < 0: x1 = 0
+            if y1 < 0: y1 = 0
+            if x1 + w > vw: x1 = vw - w
+            if y1 + h > vh: y1 = vh - h
+            
         return [int(x1), int(y1), int(x1 + w), int(y1 + h)]
 
     def maintain_aspect_ratio_resize(
@@ -155,6 +195,7 @@ class CropHandlerMixin:
         vh = getattr(self, "vid_h", self.CANVAS_H)
         
         edges = self.resize_edge or {}
+        allow_oversize = getattr(self, 'allow_oversize_var', None) and self.allow_oversize_var.get()
 
         # 最小サイズを保証
         if x2 - x1 < self.MIN_W:
@@ -168,24 +209,24 @@ class CropHandlerMixin:
             else:
                 y1 = y2 - self.MIN_H
 
-        # 動画解像度の範囲内に制約
-        if x1 < 0:
-            x1 = 0
-            if edges.get("l", False):
-                x2 = max(x2, self.MIN_W)
-        if x2 > vw:
-            x2 = vw
-            if edges.get("r", False):
-                x1 = min(x1, vw - self.MIN_W)
-
-        if y1 < 0:
-            y1 = 0
-            if edges.get("t", False):
-                y2 = max(y2, self.MIN_H)
-        if y2 > vh:
-            y2 = vh
-            if edges.get("b", False):
-                y1 = min(y1, vh - self.MIN_H)
+        if not allow_oversize:
+            # 動画解像度の範囲内に制約
+            if x1 < 0:
+                x1 = 0
+                if edges.get("l", False):
+                    x2 = max(x2, self.MIN_W)
+            if x2 > vw:
+                x2 = vw
+                if edges.get("r", False):
+                    x1 = min(x1, vw - self.MIN_W)
+            if y1 < 0:
+                y1 = 0
+                if edges.get("t", False):
+                    y2 = max(y2, self.MIN_H)
+            if y2 > vh:
+                y2 = vh
+                if edges.get("b", False):
+                    y1 = min(y1, vh - self.MIN_H)
 
         return [int(x1), int(y1), int(x2), int(y2)]
 
@@ -234,19 +275,21 @@ class CropHandlerMixin:
         # 範囲チェック
         vw = getattr(self, "vid_w", self.CANVAS_W)
         vh = getattr(self, "vid_h", self.CANVAS_H)
+        allow_oversize = getattr(self, 'allow_oversize_var', None) and self.allow_oversize_var.get()
         
-        if new_x1 < 0:
-            new_x1 = 0
-            new_x2 = x2 - x1
-        if new_y1 < 0:
-            new_y1 = 0
-            new_y2 = y2 - y1
-        if new_x2 > vw:
-            new_x2 = vw
-            new_x1 = vw - (x2 - x1)
-        if new_y2 > vh:
-            new_y2 = vh
-            new_y1 = vh - (y2 - y1)
+        if not allow_oversize:
+            if new_x1 < 0:
+                new_x1 = 0
+                new_x2 = x2 - x1
+            if new_y1 < 0:
+                new_y1 = 0
+                new_y2 = y2 - y1
+            if new_x2 > vw:
+                new_x2 = vw
+                new_x1 = vw - (x2 - x1)
+            if new_y2 > vh:
+                new_y2 = vh
+                new_y1 = vh - (y2 - y1)
         
         self.crop_rect = [int(new_x1), int(new_y1), int(new_x2), int(new_y2)]
         self._sync_crop_rect_ui()

@@ -4,9 +4,11 @@
 """
 from __future__ import annotations
 
+import ctypes
 import datetime
 import os
 import threading
+import time
 import tkinter as tk
 import tkinter.ttk as ttk
 from tkinter import filedialog, messagebox
@@ -17,10 +19,11 @@ import mss
 import numpy as np
 from PIL import Image, ImageTk
 
-from config import get_base_dir
+from config import get_base_dir, load_global_config, save_global_config
 from ui_utils import add_tooltip
 from window_utils import WindowUtils
 from recorder_core import ScreenRecorderLogic
+import overlay_utils
 
 if TYPE_CHECKING:
     from video_frame_cropper import VideoCropperApp
@@ -91,6 +94,11 @@ class ScreenRecorderApp:
         self.player_trajectory_data: List[tuple] = []
         self.last_player_frame: Optional[np.ndarray] = None
         
+        # 赤枠表示の安定性管理用
+        self.last_target_rect = None
+        self.last_rect_change_time = 0.0
+        self.STABILITY_THRESHOLD = 0.1 # 秒
+        
         # UI変数
         self.source_var = tk.StringVar(value="desktop") # desktop / window
         self.target_var = tk.StringVar()
@@ -98,17 +106,46 @@ class ScreenRecorderApp:
         self.fps_var = tk.IntVar(value=15)
         self.quality_var = tk.StringVar(value="最高")
         self.save_path_var = tk.StringVar(value=self.save_dir)
-        self.record_cursor_var = tk.BooleanVar(value=False) # マウスポインタ録画
-        self.exclusive_window_var = tk.BooleanVar(value=False) # ウィンドウ単体キャプチャ
+        self.record_cursor_var = tk.BooleanVar(value=False) # 機能削除（変数は残すがUIは消す）
+        self.show_region_var = tk.BooleanVar(value=True)    # 録画枠を表示するか
+        self.exclusive_window_var = tk.BooleanVar(value=True) # ウィンドウ単体キャプチャ (デフォルトON)
         self.record_tsv_var = tk.BooleanVar(value=True)
         self.seek_var = tk.DoubleVar()
         self.show_trajectory_var = tk.BooleanVar(value=True)
+        self.player_fit_var = tk.BooleanVar(value=True) # キャンバスに合わせる
         
+        # プレイヤーのパン・ズーム用
+        self.player_zoom = 1.0
+        self.player_pan_x = 0
+        self.player_pan_y = 0
+        self._player_panning = False
+        self._player_pan_start = (0, 0)
+
+        # プレビューのパン・ズーム用
+        self.preview_fit_var = tk.BooleanVar(value=True)
+        self.preview_zoom = 1.0
+        self.preview_pan_x = 0
+        self.preview_pan_y = 0
+        self._preview_panning = False
+        self._preview_pan_start = (0, 0)
+
+        # 共通設定 (テーマ) のロード
+        self.global_config = load_global_config()
+        self.theme = self.global_config.get("theme", {})
+        
+        # 設定から復元
+        saved_source = self.global_config.get("recorder_source", "desktop")
+        if saved_source in ["desktop", "window"]:
+            self.source_var.set(saved_source)
+        
+        self.show_region_var.set(self.global_config.get("recorder_show_region", True))
+
         # UIパーツ参照用
+
         self.widgets_to_lock: List[tk.Widget] = []
         self.region_window: Optional[tk.Toplevel] = None
         self.monitors: List[Dict[str, Any]] = []
-        self.windows: List[Tuple[Any, str]] = []
+        self.windows: List[Tuple[Any, str, str, int]] = [] # (hwnd, title, process_name, pid)
         self.file_items: List[str] = [] # 一覧に表示されている実際のファイル名
         
         self._build_ui()
@@ -119,6 +156,21 @@ class ScreenRecorderApp:
         self.load_window_geometry()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # タブ切り替えイベント
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+        
+        # 初期表示の追従開始
+        if self.notebook.select() == str(self.tab_record):
+            self._update_region_tracking()
+
+    def on_tab_changed(self, event):
+        """タブ切り替え時の処理"""
+        current_tab = self.notebook.select()
+        if current_tab == str(self.tab_record):
+            self._update_region_tracking()
+        else:
+            self._hide_recording_region()
 
     def _check_single_instance(self) -> bool:
         """二重起動チェック。既に起動している場合は前面に出して終了。"""
@@ -155,6 +207,11 @@ class ScreenRecorderApp:
         
         config["recorder_maximized"] = (self.root.state() == 'zoomed')
         config["recorder_geometry"] = self.root.geometry()
+        config["recorder_source"] = self.source_var.get()
+        config["recorder_show_region"] = self.show_region_var.get()
+        
+        # ターゲット情報の保存
+        self._save_recording_target_to_config(config)
         
         try:
             config["recorder_sash_position"] = self.main_paned.sash_coord(0)[1]
@@ -169,7 +226,7 @@ class ScreenRecorderApp:
         self.preview_active = False
         
         if self.recorder_logic.is_recording:
-            if messagebox.askyesno("確認", "録画中です。停止して閉じますか？"):
+            if messagebox.askyesno("確認", "録画中です。停止して閉じますか？", parent=self.root):
                 self.recorder_logic.stop_recording()
                 self.recorder_logic.wait_for_stop(timeout=2.0)
             else:
@@ -297,6 +354,41 @@ class ScreenRecorderApp:
         self.btn_update = tk.Button(target_frame, text="更新", command=self.update_source_list, width=4, bg=self.COLOR_BTN_UPDATE)
         self.btn_update.pack(side=tk.LEFT)
         self.widgets_to_lock.extend([self.btn_update, self.combo_target])
+
+        # 3.5 座標・サイズ入力
+        geo_frame = tk.Frame(self.tab_record)
+        geo_frame.pack(fill=tk.X, padx=10, pady=2)
+        
+        self.geo_x = tk.IntVar()
+        self.geo_y = tk.IntVar()
+        self.geo_w = tk.IntVar()
+        self.geo_h = tk.IntVar()
+        
+        tk.Label(geo_frame, text="座標 X:").pack(side=tk.LEFT)
+        self.entry_x = tk.Entry(geo_frame, textvariable=self.geo_x, width=5)
+        self.entry_x.pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(geo_frame, text="Y:").pack(side=tk.LEFT)
+        self.entry_y = tk.Entry(geo_frame, textvariable=self.geo_y, width=5)
+        self.entry_y.pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(geo_frame, text="W:").pack(side=tk.LEFT)
+        self.entry_w = tk.Entry(geo_frame, textvariable=self.geo_w, width=5)
+        self.entry_w.pack(side=tk.LEFT, padx=2)
+        
+        tk.Label(geo_frame, text="H:").pack(side=tk.LEFT)
+        self.entry_h = tk.Entry(geo_frame, textvariable=self.geo_h, width=5)
+        self.entry_h.pack(side=tk.LEFT, padx=2)
+        
+        self.btn_apply_geo = tk.Button(geo_frame, text="適用", command=self.apply_window_geometry, width=4, bg=self.COLOR_BTN_UPDATE)
+        self.btn_apply_geo.pack(side=tk.LEFT, padx=5)
+        
+        for entry in [self.entry_x, self.entry_y, self.entry_w, self.entry_h]:
+            entry.bind("<Return>", lambda e: self.apply_window_geometry())
+            entry.bind("<Tab>", lambda e: self.apply_window_geometry())
+            self.widgets_to_lock.append(entry)
+        self.widgets_to_lock.append(self.btn_apply_geo)
+
         
         # 4. プレビュー
         preview_label_frame = tk.LabelFrame(self.tab_record, text="プレビュー")
@@ -306,6 +398,13 @@ class ScreenRecorderApp:
         self.preview_canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.preview_image_id = None
         self.preview_canvas.bind("<Configure>", lambda e: self._on_canvas_resize("preview"))
+        self.preview_canvas.bind("<ButtonPress-2>", self._on_preview_middle_down)
+        self.preview_canvas.bind("<B2-Motion>", self._on_preview_middle_drag)
+        self.preview_canvas.bind("<ButtonRelease-2>", self._on_preview_middle_up)
+        self.preview_canvas.bind("<Double-Button-2>", self._on_preview_middle_double_click)
+        self.preview_canvas.bind("<MouseWheel>", self._on_preview_wheel)
+        self.preview_canvas.bind("<Button-4>", self._on_preview_wheel)
+        self.preview_canvas.bind("<Button-5>", self._on_preview_wheel)
 
         # 5. 録画設定
         settings_frame = tk.Frame(self.tab_record)
@@ -323,17 +422,23 @@ class ScreenRecorderApp:
         # 6. オプション
         options_frame = tk.Frame(self.tab_record)
         options_frame.pack(fill=tk.X, padx=10, pady=2)
-        tk.Checkbutton(options_frame, text="マウスポインタを映像に含める", variable=self.record_cursor_var).pack(side=tk.LEFT)
+        
+        self.check_show_region = tk.Checkbutton(options_frame, text="録画枠を表示", variable=self.show_region_var)
+        self.check_show_region.pack(side=tk.LEFT)
+        self.widgets_to_lock.append(self.check_show_region)
         
         self.check_tsv = tk.Checkbutton(options_frame, text="操作履歴(TSV)", variable=self.record_tsv_var)
         self.check_tsv.pack(side=tk.LEFT, padx=5)
         self.widgets_to_lock.append(self.check_tsv)
 
-        self.check_exclusive = tk.Checkbutton(options_frame, text="他窓除外(Win10+)", variable=self.exclusive_window_var)
+        self.check_exclusive = tk.Checkbutton(options_frame, text="WGCで選択したウィンドウのみキャプチャする(Win10以降)", variable=self.exclusive_window_var)
         self.check_exclusive.pack(side=tk.LEFT, padx=5)
         self.widgets_to_lock.append(self.check_exclusive)
 
-        # 7. 録画ボタン
+        self.check_preview_fit = tk.Checkbutton(options_frame, text="プレビューを拡大・縮小する", variable=self.preview_fit_var)
+        self.check_preview_fit.pack(side=tk.LEFT)
+        self.widgets_to_lock.append(self.check_preview_fit)
+
         self.btn_record = tk.Button(self.tab_record, text="● 録画開始", bg="#ffcccc", font=("Arial", 12, "bold"),
                                     command=self.toggle_recording)
         self.btn_record.pack(fill=tk.X, padx=15, pady=10)
@@ -363,8 +468,85 @@ class ScreenRecorderApp:
         self.lbl_time = tk.Label(p_btns, text="00:00 / 00:00")
         self.lbl_time.pack(side=tk.LEFT, padx=5)
 
-        self.chk_player_traj = tk.Checkbutton(p_btns_container, text="マウス軌跡を表示", variable=self.show_trajectory_var, command=self.refresh_player_canvas)
+        self.chk_player_traj = tk.Checkbutton(p_btns_container, text="マウス・キー入力の軌跡を表示", variable=self.show_trajectory_var, command=self.refresh_player_canvas)
         self.chk_player_traj.pack(side=tk.LEFT, padx=5)
+
+        self.chk_player_fit = tk.Checkbutton(p_btns_container, text="プレビューを拡大・縮小する", variable=self.player_fit_var, command=self.refresh_player_canvas)
+        self.chk_player_fit.pack(side=tk.RIGHT, padx=5)
+
+        # プレイヤーキャンバスへのバインド (パン・ズーム)
+        self.player_canvas.bind("<ButtonPress-2>", self._on_player_middle_down)
+        self.player_canvas.bind("<B2-Motion>", self._on_player_middle_drag)
+        self.player_canvas.bind("<ButtonRelease-2>", self._on_player_middle_up)
+        self.player_canvas.bind("<Double-Button-2>", self._on_player_middle_double_click)
+        self.player_canvas.bind("<MouseWheel>", self._on_player_wheel)
+        self.player_canvas.bind("<Button-4>", self._on_player_wheel)
+        self.player_canvas.bind("<Button-5>", self._on_player_wheel)
+
+    def _save_recording_target_to_config(self, config: Dict[str, Any]):
+        """録画対象の情報を設定辞書に保存 (save_window_geometryから呼ばれる)"""
+        mode = self.source_var.get()
+        if mode == "desktop":
+            config["recorder_desktop_index"] = self.combo_target.current()
+        elif mode == "window":
+            idx = self.combo_target.current()
+            if idx >= 0 and idx < len(self.windows):
+                # self.windows = [(hwnd, title, pname, pid), ...]
+                hwnd, title, pname, pid = self.windows[idx]
+                config["recorder_target_pid"] = pid
+                config["recorder_target_process"] = pname
+                config["recorder_target_title"] = title
+
+    def _restore_recording_target_from_config(self, display_names: List[str]):
+        """設定から録画対象を復元してコンボボックスを選択状態にする"""
+        mode = self.source_var.get()
+        
+        # 1. Desktop Mode
+        if mode == 'desktop':
+            saved_idx = self.global_config.get("recorder_desktop_index")
+            if saved_idx is not None and isinstance(saved_idx, int):
+                if 0 <= saved_idx < len(display_names):
+                    self.combo_target.current(saved_idx)
+            return
+
+        # 2. Window Mode
+        if mode == 'window':
+            # まず現在の選択が有効ならそれを維持 (リスト更新時など)
+            curr = self.target_var.get()
+            if curr in display_names:
+                self.combo_target.set(curr)
+                return
+
+            # 無効(リストにない)または空なら、保存された設定からの復元を試みる
+            target_pid = self.global_config.get("recorder_target_pid")
+            target_proc = self.global_config.get("recorder_target_process")
+            
+            if target_pid or target_proc:
+                best_idx = 0
+                found = False
+                
+                # Priority 1: PID Match
+                if target_pid:
+                    for i, win in enumerate(self.windows):
+                        # win = (hwnd, title, pname, pid)
+                        if win[3] == target_pid:
+                            best_idx = i
+                            found = True
+                            break
+                
+                # Priority 2: Process Name Match (if PID mismatch)
+                if not found and target_proc:
+                    for i, win in enumerate(self.windows):
+                        if win[2] == target_proc:
+                            best_idx = i
+                            found = True
+                            break
+                
+                self.combo_target.current(best_idx)
+            else:
+                # Default to first
+                if display_names:
+                    self.combo_target.current(0)
 
     def update_source_list(self):
         """録画対象のリストを更新"""
@@ -375,38 +557,66 @@ class ScreenRecorderApp:
         if mode == 'desktop':
             # モニター一覧取得
             self.monitors = self.window_utils.get_monitor_info()
-            
             display_names = [f"Display {i+1}: {m['width']}x{m['height']}" for i, m in enumerate(self.monitors)]
             self.combo_target['values'] = display_names
+            
             if display_names:
-                self.combo_target.current(0)
+                self._restore_recording_target_from_config(display_names)
+                if self.combo_target.current() == -1:
+                    self.combo_target.current(0)
+            else:
+                self.target_var.set("")
+            
             self.entry_filter.config(state=tk.DISABLED)
+            for w in [self.entry_x, self.entry_y, self.entry_w, self.entry_h, self.btn_apply_geo]:
+                w.config(state=tk.DISABLED)
                 
         elif mode == 'window':
             # ウィンドウ一覧取得
             self.windows = self.window_utils.enum_windows(filter_text)
-            
-            display_names = []
-            for h, t in self.windows:
-                pname = self.window_utils.get_process_name(h)
-                display_names.append(f"[{pname}] {t} ({h})")
-                
+            display_names = [f"[{p}] {t} ({h})" for h, t, p, pid in self.windows]
             self.combo_target['values'] = display_names
+            
             if display_names:
-                # 現在の選択がまだリストにあれば維持、なければ最初
-                curr = self.target_var.get()
-                if curr in display_names:
-                    self.combo_target.set(curr)
-                else:
-                    self.combo_target.current(0)
+                self._restore_recording_target_from_config(display_names)
             else:
                 self.target_var.set("")
+            
             self.entry_filter.config(state=tk.NORMAL)
-        
+            for w in [self.entry_x, self.entry_y, self.entry_w, self.entry_h, self.btn_apply_geo]:
+                w.config(state=tk.NORMAL)
+
         self.on_target_changed(None)
 
     def on_target_changed(self, event):
-        pass
+        rect = self._get_target_rect()
+        if rect:
+            self.geo_x.set(rect['left'])
+            self.geo_y.set(rect['top'])
+            self.geo_w.set(rect['width'])
+            self.geo_h.set(rect['height'])
+            # 赤枠の表示・更新は _update_region_tracking 内の安定性ロジックに任せる
+
+    def apply_window_geometry(self):
+        """入力ボックスの値でウィンドウを移動・リサイズ"""
+        if self.source_var.get() == 'window':
+            idx = self.combo_target.current()
+            if idx >= 0 and idx < len(self.windows):
+                hwnd = self.windows[idx][0]
+                try:
+                    x = self.geo_x.get()
+                    y = self.geo_y.get()
+                    w = self.geo_w.get()
+                    h = self.geo_h.get()
+                    self.window_utils.set_window_position(hwnd, x, y, w, h)
+                    # 反映を確認するために少し待ってから更新
+                    self.root.after(100, lambda: self._force_update_target_info())
+                except Exception as e:
+                    print(f"Geometry apply error: {e}")
+
+    def _force_update_target_info(self):
+        self.on_target_changed(None)
+
 
     def _select_all_files(self):
         self.file_listbox.selection_set(0, tk.END)
@@ -468,14 +678,38 @@ class ScreenRecorderApp:
                         cw = self.preview_canvas.winfo_width()
                         ch = self.preview_canvas.winfo_height()
                         if cw > 1 and ch > 1:
-                            img.thumbnail((cw, ch), Image.Resampling.NEAREST)
+                            img_w, img_h = img.size
+                            if self.preview_fit_var.get():
+                                # 比例リサイズ
+                                ratio = min(cw / img_w, ch / img_h)
+                                new_w = int(img_w * ratio)
+                                new_h = int(img_h * ratio)
+                                if new_w > 0 and new_h > 0:
+                                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                                
+                                # 中央配置
+                                off_x = (cw - img.width) // 2
+                                off_y = (ch - img.height) // 2
+                            else:
+                                # パン・ズーム
+                                scale_view = self.preview_zoom
+                                new_w = int(img_w * scale_view)
+                                new_h = int(img_h * scale_view)
+                                if new_w > 0 and new_h > 0:
+                                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                                
+                                off_x = cw // 2 + self.preview_pan_x - img.width // 2
+                                off_y = ch // 2 + self.preview_pan_y - img.height // 2
+
                             tk_img = ImageTk.PhotoImage(img)
                             
                             if self.preview_image_id:
                                 self.preview_canvas.itemconfig(self.preview_image_id, image=tk_img)
-                                self.preview_canvas.coords(self.preview_image_id, cw//2, ch//2)
+                                # アンカーをNWに変更して座標指定
+                                self.preview_canvas.coords(self.preview_image_id, off_x, off_y)
+                                self.preview_canvas.itemconfig(self.preview_image_id, anchor=tk.NW)
                             else:
-                                self.preview_image_id = self.preview_canvas.create_image(cw//2, ch//2, image=tk_img, anchor=tk.CENTER)
+                                self.preview_image_id = self.preview_canvas.create_image(off_x, off_y, image=tk_img, anchor=tk.NW)
                             
                             self.preview_canvas.image = tk_img
                 except Exception as e:
@@ -491,17 +725,64 @@ class ScreenRecorderApp:
             self.stop_recording()
         else:
             # 開始
-            self.start_recording()
+            self.start_recording_sequence()
 
-    def start_recording(self):
+    def start_recording_sequence(self):
         rect = self._get_target_rect()
         if not rect:
-            messagebox.showerror("Error", "録画対象が取得できません")
+            messagebox.showerror("Error", "録画対象が取得できません", parent=self.root)
+            return
+            
+        # 録画開始ボタンを押した瞬間にUIをロック
+        self._set_controls_state(tk.DISABLED)
+
+        # カウントダウン表示 -> 終了後に start_recording 実行
+        self._show_countdown(3, self.start_recording)
+
+    def _show_countdown(self, count, callback):
+        """画面中央にカウントダウンを表示"""
+        if count > 0:
+            # オーバーレイウィンドウ作成（透過）
+            w = tk.Toplevel(self.root)
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            w.attributes("-transparentcolor", "white")
+            w.attributes("-alpha", 0.8)
+            
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            
+            # 対象領域の中心に表示したいが、簡易的に画面中央または対象領域中央
+            rect = self._get_target_rect()
+            if rect:
+                cx = rect['left'] + rect['width'] // 2
+                cy = rect['top'] + rect['height'] // 2
+            else:
+                cx = screen_w // 2
+                cy = screen_h // 2
+                
+            size = 200
+            w.geometry(f"{size}x{size}+{cx - size//2}+{cy - size//2}")
+            
+            lbl = tk.Label(w, text=str(count), font=("Arial", 100, "bold"), fg="red", bg="white")
+            lbl.pack(fill=tk.BOTH, expand=True)
+            
+            # 1秒後に次へ
+            self.root.after(1000, lambda: [w.destroy(), self._show_countdown(count - 1, callback)])
+        else:
+            callback()
+
+    def start_recording(self):
+
+        rect = self._get_target_rect()
+        if not rect:
+            messagebox.showerror("Error", "録画対象が取得できません", parent=self.root)
             return
         
-        # UIロック
-        self._set_controls_state(tk.DISABLED)
-        self._show_recording_region(rect)
+        
+        # UIロック (start_recording_sequence で実施済み)
+        # self._set_controls_state(tk.DISABLED)
+        # self._show_recording_region(rect) # 既に表示されているはずだが念のため
         
         # ウィンドウ追従のためのhwnd
         hwnd = None
@@ -524,7 +805,6 @@ class ScreenRecorderApp:
             rect=rect,
             fps=fps,
             hwnd=hwnd,
-            record_cursor=self.record_cursor_var.get(),
             record_tsv=self.record_tsv_var.get(),
             exclusive_window=(self.source_var.get() == 'window' and self.exclusive_window_var.get())
         )
@@ -533,17 +813,78 @@ class ScreenRecorderApp:
         self._update_region_tracking()
 
     def _update_region_tracking(self):
-        """録画中に赤枠を対象ウィンドウに追従させる"""
-        if self.recorder_logic.is_recording and self.region_window:
+        """録画中または録画タブ表示中に赤枠を対象ウィンドウに追従させる"""
+        # 条件: 録画中 OR 録画タブ表示中
+        is_in_record_tab = (self.notebook.select() == str(self.tab_record))
+        is_recording = self.recorder_logic.is_recording
+        
+        # 実際に枠を表示するかどうか
+        # show_region_var が OFF の場合は即座に消す
+        should_show = self.show_region_var.get() and (is_recording or is_in_record_tab)
+        
+        if not self.show_region_var.get():
+            self._hide_recording_region()
+
+        if should_show:
             rect = self._get_target_rect()
-            if rect:
-                thickness = self.REGION_THICKNESS
-                x = rect['left'] - thickness
-                y = rect['top'] - thickness
-                if self.region_window.winfo_exists():
-                    self.region_window.geometry(f"+{x}+{y}")
             
-            self.root.after(10, self._update_region_tracking)
+            # --- 赤枠表示の安定性ロジック ---
+            is_stable = False
+            if rect:
+                if self.last_target_rect != rect:
+                    # 矩形が変化した -> 非表示にしてタイマーリセット
+                    self.last_target_rect = rect
+                    self.last_rect_change_time = time.time()
+                    self._hide_recording_region()
+                else:
+                    # 矩形が変化していない -> 指定時間経過したか確認
+                    if time.time() - self.last_rect_change_time >= self.STABILITY_THRESHOLD:
+                        is_stable = True
+            
+            if is_stable and rect:
+                # 安定している場合のみ表示・更新
+                if not self.region_window:
+                    self._show_recording_region(rect)
+                elif self.region_window.winfo_exists():
+                    thickness = self.REGION_THICKNESS
+                    x = rect['left'] - thickness
+                    y = rect['top'] - thickness
+                    w = rect['width'] + thickness * 2
+                    h = rect['height'] + thickness * 2
+                    self.region_window.geometry(f"{w}x{h}+{x}+{y}")
+                    
+                    canvas = self.region_window.winfo_children()[0]
+                    if isinstance(canvas, tk.Canvas):
+                        if canvas.winfo_width() != w or canvas.winfo_height() != h:
+                            canvas.config(width=w, height=h)
+                            canvas.delete("all")
+                            canvas.create_rectangle(thickness//2, thickness//2, w - thickness//2, h - thickness//2, outline=self.REGION_COLOR, width=thickness)
+            # 安定していない場合は何もしない（前回の _hide で消えているはず）
+            # ------------------------------
+            
+            # 座標・サイズのUI自動更新
+            # ユーザーが入力中でない場合のみ更新する
+            try:
+                focused_widget = self.root.focus_get()
+            except KeyError:
+                # Comboboxのドロップダウンなどがフォーカスを持っている場合 KeyError: 'popdown' が出ることがある
+                focused_widget = None
+            except Exception:
+                focused_widget = None
+
+            input_widgets = [self.entry_x, self.entry_y, self.entry_w, self.entry_h]
+            if focused_widget not in input_widgets:
+                if rect:
+                    if self.geo_x.get() != rect['left']: self.geo_x.set(rect['left'])
+                    if self.geo_y.get() != rect['top']: self.geo_y.set(rect['top'])
+                    if self.geo_w.get() != rect['width']: self.geo_w.set(rect['width'])
+                    if self.geo_h.get() != rect['height']: self.geo_h.set(rect['height'])
+
+        # 録画中または録画タブならループを継続
+        if is_recording or is_in_record_tab:
+            self.root.after(50, self._update_region_tracking)
+        else:
+            self._hide_recording_region()
 
     def stop_recording(self):
         self.recorder_logic.stop_recording()
@@ -557,7 +898,9 @@ class ScreenRecorderApp:
         else:
             self.btn_record.config(text="録画開始", state=tk.NORMAL, bg=self.COLOR_BTN_RECORD_START)
             self._set_controls_state(tk.NORMAL)
-            self._hide_recording_region()
+            # self._hide_recording_region() # 停止後も録画タブなら表示し続ける
+            if self.notebook.select() != str(self.tab_record):
+                self._hide_recording_region()
             
             # TSV保存呼び出し
             self.recorder_logic.save_trajectory_tsv()
@@ -602,7 +945,30 @@ class ScreenRecorderApp:
         canvas = tk.Canvas(self.region_window, width=w, height=h, bg="white", highlightthickness=0)
         canvas.pack()
         
+        try:
+            import ctypes
+            self.region_window.update_idletasks() # Ensure HWND is ready
+            # winfo_id() returns the internal widget HWND, not the toplevel frame
+            # We need to get the root ancestor (GA_ROOT = 2) for SetWindowDisplayAffinity
+            internal_hwnd = self.region_window.winfo_id()
+            GA_ROOT = 2
+            hwnd = ctypes.windll.user32.GetAncestor(internal_hwnd, GA_ROOT)
+            if hwnd == 0:
+                hwnd = internal_hwnd  # Fallback to internal hwnd
+            
+            # print(f"Setting affinity for HWND: {hwnd} (internal: {internal_hwnd})")
+            ret = self.window_utils.set_window_display_affinity(hwnd, True)
+            if not ret:
+                # GetLastError for debugging
+                error_code = ctypes.windll.kernel32.GetLastError()
+                # print(f"Failed to set display affinity for HWND: {hwnd}, Error: {error_code}")
+            # else:
+            #    print(f"Successfully set display affinity for HWND: {hwnd}")
+        except Exception as e:
+            pass
+
         canvas.create_rectangle(thickness//2, thickness//2, w - thickness//2, h - thickness//2, outline=self.REGION_COLOR, width=thickness)
+
 
     def _hide_recording_region(self):
         if self.region_window:
@@ -660,9 +1026,9 @@ class ScreenRecorderApp:
             try:
                 os.startfile(tsv_path)
             except Exception as e:
-                messagebox.showerror("Error", f"TSVファイルを開けませんでした:\n{e}")
+                messagebox.showerror("Error", f"TSVファイルを開けませんでした:\n{e}", parent=self.root)
         else:
-            messagebox.showwarning("Warning", "対応するTSVファイルが見つかりません。")
+            messagebox.showwarning("Warning", "対応するTSVファイルが見つかりません。", parent=self.root)
 
     def on_file_select(self, event):
         idx = self.file_listbox.curselection()
@@ -794,7 +1160,7 @@ class ScreenRecorderApp:
         count = len(indices)
         msg = f"{count} 個のアイテムを削除しますか？" if count > 1 else f"{self.file_items[indices[0]]} を削除しますか？"
         
-        if messagebox.askyesno("確認", msg):
+        if messagebox.askyesno("確認", msg, parent=self.root):
             self.stop_playback()
             if self.cap:
                 self.cap.release()
@@ -937,54 +1303,177 @@ class ScreenRecorderApp:
         cw = self.player_canvas.winfo_width()
         ch = self.player_canvas.winfo_height()
         if cw > 1 and ch > 1:
-            img.thumbnail((cw, ch), Image.Resampling.LANCZOS)
-            tk_img = ImageTk.PhotoImage(img)
-            self.player_canvas.delete("all")
-            self.player_canvas.create_image(cw//2, ch//2, image=tk_img, anchor=tk.CENTER, tags="img")
-            self.player_canvas.image = tk_img
+            img_w, img_h = img.size
             
-            # 軌跡描画
+            if self.player_fit_var.get():
+                # キャンバスに適合 (比例リサイズ)
+                ratio = min(cw / img_w, ch / img_h)
+                new_w = int(img_w * ratio)
+                new_h = int(img_h * ratio)
+                if new_w > 0 and new_h > 0:
+                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                
+                # 中央表示用のオフセット (オーバーレイ描画の座標計算に使用)
+                off_x = (cw - img.width) // 2
+                off_y = (ch - img.height) // 2
+                scale_view = ratio
+            else:
+                # 自由変形 (ズーム・パン)
+                scale_view = self.player_zoom
+                new_w = int(img_w * scale_view)
+                new_h = int(img_h * scale_view)
+                if new_w > 0 and new_h > 0:
+                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                
+                # キャンバス中央基準でパンを適用
+                off_x = cw // 2 + self.player_pan_x - img.width // 2
+                off_y = ch // 2 + self.player_pan_y - img.height // 2
+
+            # 以降の計算で使用する img スケール (元動画 -> 表示画像)
+            img_w_disp, img_h_disp = img.size
+            orig_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            orig_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            scale_x = img_w_disp / orig_w if orig_w > 0 else 1.0
+            scale_y = img_h_disp / orig_h if orig_h > 0 else 1.0
+
+            # 軌跡・オーバーレイ描画
             if self.show_trajectory_var.get() and self.player_trajectory_data:
                 curr_pos = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 if self.cap else 0
-                closest = None
-                for row in self.player_trajectory_data:
-                    if abs(row[0] - curr_pos) < 0.1:
-                        closest = row
+                
+                # 1. マウス軌跡
+                mouse_data = None
+                current_row_idx = -1
+                for i, row in enumerate(self.player_trajectory_data):
+                    t, f_idx, vx, vy, click, keys = row
+                    if abs(t - curr_pos) < 0.1:
+                        mouse_data = row
+                        current_row_idx = i
                         break
                 
-                if closest:
-                    t, f_idx, vx, vy, click, keys = closest
-                    img_w, img_h = img.size
-                    orig_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-                    orig_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                    
-                    if orig_w > 0 and orig_h > 0:
-                        scale_x = img_w / orig_w
-                        scale_y = img_h / orig_h
-                        off_x = (cw - img_w) // 2
-                        off_y = (ch - img_h) // 2
-                        cx = vx * scale_x + off_x
-                        cy = vy * scale_y + off_y
-                        
-                        color = "red"
-                        outline_width = 2
-                        if click != "None":
-                            color = "yellow"
-                            outline_width = 4
-                            self.player_canvas.create_oval(cx-12, cy-12, cx+12, cy+12, outline="yellow", width=1, tags="overlay")
-                        
-                        r = 6
-                        self.player_canvas.create_oval(cx-r, cy-r, cx+r, cy+r, outline=color, width=outline_width, tags="overlay")
-                        self.player_canvas.create_oval(cx-2, cy-2, cx+2, cy+2, fill=color, tags="overlay")
+                if mouse_data:
+                    t_curr, f_idx, vx, vy, click, keys = mouse_data
+                    # ripple logic / overlay_utils 呼び出し ... (省略せず元のロジックをスケールに合わせる)
+                    ripple_age = 0.0
+                    ripple_type = ""
+                    lookback_sec = 0.5
+                    if current_row_idx > 0:
+                        for j in range(current_row_idx, 0, -1):
+                            row_p = self.player_trajectory_data[j-1]
+                            row_c = self.player_trajectory_data[j]
+                            t_p, c_p = row_p[0], row_p[4]
+                            t_c, c_c = row_c[0], row_c[4]
+                            if t_curr - t_c > lookback_sec: break
+                            for char, name in [("L", "left"), ("R", "right"), ("M", "middle")]:
+                                if char in c_p and char not in c_c:
+                                    ripple_type = name
+                                    ripple_age = t_curr - t_c
+                                    break
+                            if ripple_type: break
 
-                        if keys != "None":
-                            self.player_canvas.create_text(
-                                cw // 2, ch - 30, 
-                                text=f"Keys: {keys}", 
-                                fill="yellow", 
-                                font=("Arial", 14, "bold"),
-                                tags="overlay"
-                            )
+                    overlay_utils.draw_mouse_overlay(
+                        img, vx, vy, click, 
+                        scale_x, scale_y, 
+                        self.theme,
+                        ripple_age=ripple_age,
+                        ripple_type=ripple_type
+                    )
+
+                # 2. 入力履歴
+                fade_duration = self.theme.get("input_overlay", {}).get("fade_duration", 2.0)
+                history_inputs = []
+                last_item = None
+                
+                start_idx = current_row_idx if current_row_idx >= 0 else 0
+                for i in range(start_idx, -1, -1):
+                    t, f_idx, vx, vy, click, keys = self.player_trajectory_data[i]
+                    if curr_pos - t > fade_duration: break
+                    item_text = overlay_utils.get_input_display_text(click, keys)
+                    if not item_text: continue
+                    if item_text != last_item:
+                        history_inputs.append((item_text, curr_pos - t))
+                        last_item = item_text
+                
+                if history_inputs:
+                    overlay_utils.draw_input_overlay(img, history_inputs, scale_x, scale_y, self.theme)
+
+            tk_img = ImageTk.PhotoImage(img)
+            self.player_canvas.delete("all")
+            # 指定されたオフセット (off_x, off_y) に合わせて描画 (anchor=NW)
+            self.player_canvas.create_image(off_x, off_y, image=tk_img, anchor=tk.NW, tags="img")
+            self.player_canvas.image = tk_img
+
+    # プレイヤーのパンニング・ズームイベント
+    def _on_player_middle_down(self, event):
+        self._player_panning = True
+        self._player_pan_start = (event.x, event.y)
+        self.player_canvas.config(cursor="fleur")
+
+    def _on_player_middle_drag(self, event):
+        if self._player_panning:
+            dx = event.x - self._player_pan_start[0]
+            dy = event.y - self._player_pan_start[1]
+            self.player_pan_x += dx
+            self.player_pan_y += dy
+            self._player_pan_start = (event.x, event.y)
+            self.refresh_player_canvas()
+
+    def _on_player_middle_up(self, event):
+        self._player_panning = False
+        self.player_canvas.config(cursor="")
+
+    def _on_player_middle_double_click(self, event):
+        self.player_pan_x = 0
+        self.player_pan_y = 0
+        self.player_zoom = 1.0
+        self.refresh_player_canvas()
+
+    def _on_player_wheel(self, event):
+        if event.num == 4 or event.delta > 0:
+            self.player_zoom *= 1.1
+        elif event.num == 5 or event.delta < 0:
+            self.player_zoom /= 1.1
+        
+        # 制限
+        self.player_zoom = max(0.1, min(10.0, self.player_zoom))
+        self.refresh_player_canvas()
+
+    # プレビューのパンニング・ズームイベント
+    def _on_preview_middle_down(self, event):
+        self._preview_panning = True
+        self._preview_pan_start = (event.x, event.y)
+        self.preview_canvas.config(cursor="fleur")
+
+    def _on_preview_middle_drag(self, event):
+        if self._preview_panning:
+            dx = event.x - self._preview_pan_start[0]
+            dy = event.y - self._preview_pan_start[1]
+            self.preview_pan_x += dx
+            self.preview_pan_y += dy
+            self._preview_pan_start = (event.x, event.y)
+            # プレビューは _start_preview ループで更新されるが、即時反映させたい場合はここでも呼べる
+            # ただしキャプチャ処理が重いので、変数の更新だけにして次のループに任せるか、
+            # あるいは _start_preview を強制的に呼ぶか。
+            # ここでは滑らかさを優先してループ任せにする (interval=100ms なので少しカクつくかも)
+
+    def _on_preview_middle_up(self, event):
+        self._preview_panning = False
+        self.preview_canvas.config(cursor="")
+
+    def _on_preview_middle_double_click(self, event):
+        self.preview_pan_x = 0
+        self.preview_pan_y = 0
+        self.preview_zoom = 1.0
+        # 即時リセット
+        # self._start_preview() # may be too heavy
+
+    def _on_preview_wheel(self, event):
+        if event.num == 4 or event.delta > 0:
+            self.preview_zoom *= 1.1
+        elif event.num == 5 or event.delta < 0:
+            self.preview_zoom /= 1.1
+        
+        # 制限
+        self.preview_zoom = max(0.1, min(10.0, self.preview_zoom))
 
     def _on_canvas_resize(self, mode):
         if mode == "player" and self.last_player_frame is not None:

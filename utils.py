@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from math import gcd
 
@@ -136,3 +137,69 @@ def ratio_label_from_wh(w: int, h: int) -> str:
         return f"{int(w // g)}:{int(h // g)}"
     except Exception:
         return f"{w}:{h}"
+
+
+def open_folder_with_selection(path: str) -> None:
+    """ファイルをハイライト（選択）した状態でフォルダを開く."""
+    if not path or not os.path.exists(path):
+        return
+
+    path = os.path.abspath(path)
+    try:
+        if os.name == 'nt':
+            # Windows: エクスプローラーでファイルを選択状態にする
+            # フォルダの場合はそのフォルダ自体が選択される
+            norm_path = os.path.normpath(path)
+            subprocess.Popen(['explorer', f'/select,{norm_path}'])
+        elif sys.platform == 'darwin':
+            # macOS: Finderで表示（選択状態）
+            subprocess.run(['open', '-R', path], check=True)
+        else:
+            # Linux等 (選択状態にする標準的な方法がないため、単に開く)
+            parent = os.path.dirname(path) if os.path.isfile(path) else path
+            subprocess.run(['xdg-open', parent], check=True)
+    except Exception as e:
+        print(f"Error opening folder: {e}")
+
+
+import numpy as np
+
+def get_safe_crop(img: np.ndarray, rect: list[int] | tuple[int, int, int, int], bg_color: tuple[int, int, int] = (0, 0, 0)) -> np.ndarray:
+    """矩形範囲で画像をクロップする。画像範囲外は bg_color で埋める."""
+    if img is None:
+        return None
+        
+    x1, y1, x2, y2 = rect
+    
+    # 矩形の幅・高さ
+    w = x2 - x1
+    h = y2 - y1
+    
+    if w <= 0 or h <= 0:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+        
+    img_h, img_w = img.shape[:2]
+    
+    # 画像の有効範囲との共通部分を計算
+    ix1 = max(0, x1)
+    iy1 = max(0, y1)
+    ix2 = min(img_w, x2)
+    iy2 = min(img_h, y2)
+    
+    # 出力画像（背景色で初期化）
+    # OpenCV は BGR なので bg_color も BGR 想定だが、引数はタプルで渡される
+    out_img = np.full((h, w, 3), bg_color, dtype=np.uint8)
+    
+    # 有効範囲が存在する場合のみコピー
+    if ix1 < ix2 and iy1 < iy2:
+        crop = img[iy1:iy2, ix1:ix2]
+        
+        # 出力画像上の配置位置
+        ox1 = ix1 - x1
+        oy1 = iy1 - y1
+        ox2 = ox1 + (ix2 - ix1)
+        oy2 = oy1 + (iy2 - iy1)
+        
+        out_img[oy1:oy2, ox1:ox2] = crop
+        
+    return out_img
