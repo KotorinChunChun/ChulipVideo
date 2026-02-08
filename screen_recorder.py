@@ -19,14 +19,15 @@ import mss
 import numpy as np
 from PIL import Image, ImageTk
 
-from config import get_base_dir, load_global_config, save_global_config
+from config import get_base_dir, load_global_config, save_global_config, PROJECT_NAME
+from utils import resource_path
 from ui_utils import add_tooltip
 from window_utils import WindowUtils
 from recorder_core import ScreenRecorderLogic
 import overlay_utils
 
 if TYPE_CHECKING:
-    from video_frame_cropper import VideoCropperApp
+    from ChulipVideo import VideoCropperApp
 
 
 class ScreenRecorderApp:
@@ -61,7 +62,13 @@ class ScreenRecorderApp:
             self.root = tk.Toplevel(root)
             self.standalone = False
             
-        self.root.title("録画ツール")
+        self.root.title(f"{PROJECT_NAME} 録画ツール")
+        # アイコン設定
+        try:
+            self.icon_image = tk.PhotoImage(file=resource_path("ChulipVideo.png"))
+            self.root.iconphoto(True, self.icon_image)
+        except Exception as e:
+            print(f"Recorder Icon Load Error: {e}")
         # 二重起動チェック
         if not self._check_single_instance():
             self.root.destroy()
@@ -76,7 +83,7 @@ class ScreenRecorderApp:
             self.save_dir = self._load_save_dir_from_config()
         
         if not self.save_dir:
-            self.save_dir = os.path.join(os.path.expanduser("~"), "Videos", "AntigravityRecorder")
+            self.save_dir = os.path.join(os.path.expanduser("~"), "Videos", PROJECT_NAME)
         
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir, exist_ok=True)
@@ -176,7 +183,7 @@ class ScreenRecorderApp:
         """二重起動チェック。既に起動している場合は前面に出して終了。"""
         if not self.standalone:
             return True
-        return self.window_utils.check_single_instance("AntigravityScreenRecorder_Mutex", "録画ツール")
+        return self.window_utils.check_single_instance(f"{PROJECT_NAME}ScreenRecorder_Mutex", "録画ツール")
 
     def load_window_geometry(self):
         """設定からウィンドウの状態を復元."""

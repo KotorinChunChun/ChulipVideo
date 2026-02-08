@@ -10,8 +10,11 @@ from typing import TYPE_CHECKING, Any
 
 from utils import get_base_dir, ratio_label_from_wh
 
+# 定数
+PROJECT_NAME = "ChulipVideo"
+
 # 設定ファイル名を定数化
-CONFIG_FILENAME = "video_frame_cropper_config.json"
+CONFIG_FILENAME = f"{PROJECT_NAME}_config.json"
 
 # デフォルト解像度プリセット
 DEFAULT_PRESETS = {

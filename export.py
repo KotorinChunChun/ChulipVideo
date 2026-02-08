@@ -620,7 +620,7 @@ class ExportMixin:
                             with open(tsv_save_path, 'w', newline='', encoding='utf-8') as f:
                                 writer = csv.writer(f, delimiter='\t')
                                 # recoder_core.py の形式に合わせる ("frame" はメモリデータにはないので省略するか、0で埋めるか)
-                                # ここでは既存の video_frame_cropper 実装に合わせておくが、ヘッダー名を timestamp にする
+                                # ここでは既存の ChulipVideo 実装に合わせておくが、ヘッダー名を timestamp にする
                                 writer.writerow(['timestamp', 'frame', 'x', 'y', 'click', 'keys'])
                                 for r in extracted_log:
                                     # (rel_t, frame_idx, x, y, click, keys) 

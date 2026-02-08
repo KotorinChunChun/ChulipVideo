@@ -26,6 +26,21 @@ def get_base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def resource_path(relative_path: str) -> str:
+    """リソースへの絶対パスを返す（PyInstallerの1ファイル化に対応）.
+    
+    PyInstallerで1ファイル化した際は一時フォルダ(_MEIPASS)を参照し、
+    通常実行時は実行ディレクトリを参照する。
+    """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+
 def sec_to_hhmmss(sec: float) -> str:
     """秒数をHHMMSS形式の文字列に変換する（ファイル名用）."""
     sec = int(sec)

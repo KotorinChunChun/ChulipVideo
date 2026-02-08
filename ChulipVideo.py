@@ -27,9 +27,11 @@ from utils import (
     ratio_value_from_str,
     ratio_label_from_wh,
     open_folder_with_selection,
+    resource_path,
 )
 from config import (
     CONFIG_FILENAME,
+    PROJECT_NAME,
     load_global_config,
     save_global_config,
     load_video_settings,
@@ -73,7 +75,14 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
     def __init__(self, root):
         self.root = root
-        self.root.title("ChulipVideo - Created By ことりちゅん - v0.2.3")
+        self.root.title(f"{PROJECT_NAME} - Created By ことりちゅん - v0.2.3")
+        
+        # アイコン設定
+        try:
+            self.icon_image = tk.PhotoImage(file=resource_path("ChulipVideo.png"))
+            self.root.iconphoto(True, self.icon_image)
+        except Exception as e:
+            print(f"Icon Load Error: {e}")
         
         # Load global config for theme
         self.global_config = load_global_config()

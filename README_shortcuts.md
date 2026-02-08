@@ -9,6 +9,7 @@
 - Ctrl+Left/Right: 1s 移動
 - Home/End: Start/End に移動
 - Ctrl+Home/End: 動画の先頭/末尾へ移動
+- マウス戻る/進むボタン: -1s / +1s 移動
 
 ## クロップ操作関連:
 

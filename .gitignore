@@ -53,5 +53,5 @@ Thumbs.db
 # local build artifacts
 build/
 
-# Keep config tracked: video_frame_cropper_config.json should remain in repo unless you want it ignored
-video_frame_cropper_config.json
+# Keep config tracked: ChulipVideo_config.json should remain in repo unless you want it ignored
+ChulipVideo_config.json
