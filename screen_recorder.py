@@ -25,6 +25,8 @@ from ui_utils import add_tooltip
 from window_utils import WindowUtils
 from recorder_core import ScreenRecorderLogic
 import overlay_utils
+from shortcut_manager import ShortcutManager
+from shortcut_settings_dialog import ShortcutSettingsDialog
 
 if TYPE_CHECKING:
     from ChulipVideo import VideoCropperApp
@@ -87,6 +89,9 @@ class ScreenRecorderApp:
         
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir, exist_ok=True)
+
+        # ショートカット管理
+        self.shortcut_manager = ShortcutManager(os.path.join(get_base_dir(), "shortcuts.tsv"))
 
         # 状態変数
         self.preview_active = True
@@ -296,7 +301,11 @@ class ScreenRecorderApp:
         self.btn_open_tsv = tk.Button(list_ctrl, text="TSVを開く", command=self.open_tsv_file, state=tk.DISABLED, height=1)
         self.btn_open_tsv.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         
-        self.widgets_to_lock.extend([self.btn_rename, self.btn_delete, self.btn_open_tsv])
+        # キー設定ボタン (詳細設定の隣 = ここに追加)
+        self.btn_key_config = tk.Button(list_ctrl, text="キー設定", command=self.open_shortcut_settings, height=1)
+        self.btn_key_config.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        
+        self.widgets_to_lock.extend([self.btn_rename, self.btn_delete, self.btn_open_tsv, self.btn_key_config])
 
         # キーバインド
         self.file_listbox.bind("<F2>", lambda e: self.rename_file())
@@ -445,6 +454,10 @@ class ScreenRecorderApp:
         self.check_preview_fit = tk.Checkbutton(options_frame, text="プレビューを拡大・縮小する", variable=self.preview_fit_var)
         self.check_preview_fit.pack(side=tk.LEFT)
         self.widgets_to_lock.append(self.check_preview_fit)
+        
+        # self.btn_shortcut_settings = tk.Button(options_frame, text="キー設定", command=self.open_shortcut_settings, height=1)
+        # self.btn_shortcut_settings.pack(side=tk.LEFT, padx=10)
+        # self.widgets_to_lock.append(self.btn_shortcut_settings)
 
         self.btn_record = tk.Button(self.tab_record, text="● 録画開始", bg="#ffcccc", font=("Arial", 12, "bold"),
                                     command=self.toggle_recording)
@@ -480,6 +493,10 @@ class ScreenRecorderApp:
 
         self.chk_player_fit = tk.Checkbutton(p_btns_container, text="プレビューを拡大・縮小する", variable=self.player_fit_var, command=self.refresh_player_canvas)
         self.chk_player_fit.pack(side=tk.RIGHT, padx=5)
+        
+        # 再生タブにもキー設定ボタン
+        self.btn_play_key_config = tk.Button(p_btns_container, text="キー設定", command=self.open_shortcut_settings, height=1)
+        self.btn_play_key_config.pack(side=tk.RIGHT, padx=5)
 
         # プレイヤーキャンバスへのバインド (パン・ズーム)
         self.player_canvas.bind("<ButtonPress-2>", self._on_player_middle_down)
@@ -813,7 +830,8 @@ class ScreenRecorderApp:
             fps=fps,
             hwnd=hwnd,
             record_tsv=self.record_tsv_var.get(),
-            exclusive_window=(self.source_var.get() == 'window' and self.exclusive_window_var.get())
+            exclusive_window=(self.source_var.get() == 'window' and self.exclusive_window_var.get()),
+            shortcut_manager=self.shortcut_manager
         )
         
         # 赤枠追従ループ開始
@@ -1394,6 +1412,38 @@ class ScreenRecorderApp:
                 for i in range(start_idx, -1, -1):
                     t, f_idx, vx, vy, click, keys = self.player_trajectory_data[i]
                     if curr_pos - t > fade_duration: break
+                    
+                    # --- Playback Filtering Logic ---
+                    # TSV saves keys as "Ctrl,C" etc. (comma separated)
+                    # ShortcutManager expects "Ctrl+C" (plus separated)
+                    
+                    # 1. Keys
+                    if keys and keys != "None":
+                         k_list = keys.split(',')
+                         # Reconstruct mod+key string for checking
+                         # Assuming k_list is already in [Mods..., Key] order from recorder
+                         combo = "+".join(k_list)
+                         if not self.shortcut_manager.is_allowed_playback(combo):
+                              keys = "None"
+
+                    # 2. Mouse (ScreenRecorderLogic saves click separately)
+                    # But ShortcutManager might treat "Ctrl+L-Click" as a combo.
+                    # We need to check if the mouse click (with modifiers) is allowed.
+                    if click and click != "None":
+                         # Get modifiers from keys (if any)
+                         k_list = keys.split(',') if keys and keys != "None" else []
+                         parts = [k for k in k_list if k in ("Ctrl", "Shift", "Alt", "Win")]
+                         parts.append(click)
+                         combo = "+".join(parts)
+                         
+                         if not self.shortcut_manager.is_allowed_playback(combo):
+                              click = "None"
+                    
+                    # If both filtered out, skip
+                    if click == "None" and keys == "None":
+                         continue
+                    # --------------------------------
+
                     item_text = overlay_utils.get_input_display_text(click, keys)
                     if not item_text: continue
                     if item_text != last_item:
@@ -1527,6 +1577,10 @@ class ScreenRecorderApp:
         
         self.on_close()
 
+
+    def open_shortcut_settings(self):
+        """ショートカットキー設定ダイアログを開く"""
+        ShortcutSettingsDialog(self.root, self.shortcut_manager)
 
 if __name__ == "__main__":
     app = ScreenRecorderApp()

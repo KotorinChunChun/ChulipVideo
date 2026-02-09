@@ -25,6 +25,7 @@ class ScreenRecorderLogic:
         self.stop_event = threading.Event()
         self.trajectory_data: List[tuple] = []
         self.current_out_path = ""
+        self.shortcut_manager = None
 
     def start_recording(
         self,
@@ -33,13 +34,15 @@ class ScreenRecorderLogic:
         fps: int,
         hwnd: Optional[Any] = None,
         record_tsv: bool = True,
-        exclusive_window: bool = False
+        exclusive_window: bool = False,
+        shortcut_manager: Optional[Any] = None
     ):
         """録画を開始する."""
         if self.is_recording:
             return
 
         self.current_out_path = filepath
+        self.shortcut_manager = shortcut_manager
         self.stop_event.clear()
         self.is_recording = True
         self.trajectory_data = []
@@ -182,6 +185,91 @@ class ScreenRecorderLogic:
                                 if record_tsv:
                                     click_info, keys_info = self._get_input_state()
                                     
+                                    # フィルタリング
+                                    if self.shortcut_manager:
+                                        # 組み合わせ文字列を生成
+                                        # 基本: Keys (Modifier+Char) + Click
+                                        combo_parts = []
+                                        
+                                        # Keys (Sorted: Ctrl, Shift, Alt, Win first)
+                                        # _get_input_state returns modifiers first, so we just join
+                                        modifiers = []
+                                        others = []
+                                        for k in keys_info:
+                                            if k in ["Ctrl", "Shift", "Alt", "Win"]:
+                                                modifiers.append(k)
+                                            else:
+                                                others.append(k)
+                                        
+                                        # 複数キー同時押しの場合の表現は "Ctrl+Shift+A" など
+                                        # 他のキーが複数ある場合 (A, B) -> "Ctrl+A" と "Ctrl+B" 両方判定？
+                                        # ここでは単純化して、全て結合した 1つの文字列で判定する
+                                        # 例: Ctrl, Shift, A -> "Ctrl+Shift+A"
+                                        
+                                        # Click info
+                                        click_part = ""
+                                        if "L" in click_info: click_part = "L-Click"
+                                        elif "R" in click_info: click_part = "R-Click"
+                                        elif "M" in click_info: click_part = "M-Click"
+                                        
+                                        # Construct check string
+                                        # 1. Keys only
+                                        # 2. Keys + Click
+                                        
+                                        allow = False
+                                        
+                                        # 何も入力がない場合は許可 (None)
+                                        if click_info == "None" and not keys_info:
+                                            allow = True
+                                        else:
+                                            # キーがある場合
+                                            if keys_info:
+                                                key_str = "+".join(modifiers + others)
+                                                if self.shortcut_manager.is_allowed(key_str):
+                                                    allow = True
+                                            
+                                            # クリックがある場合、修飾キー+クリックの判定
+                                            if not allow and click_part:
+                                                # 例: "Ctrl+L-Click"
+                                                if modifiers:
+                                                    mod_click_str = "+".join(modifiers + [click_part])
+                                                    if self.shortcut_manager.is_allowed(mod_click_str):
+                                                        allow = True
+                                                else:
+                                                    # 修飾キーなしクリック
+                                                    # 基本的にクリック単体はフィルタ対象外（記録する）としたいが、
+                                                    # 要件「無効にした入力キーは記録しない」
+                                                    # デフォルトリストに "L-Click" 単体は入っていない -> 記録されない？
+                                                    # -> マウス操作は基本記録したいはず。
+                                                    # -> 「入力されうるショートカットキー組み合わせ一覧」とあるので、
+                                                    #    ショートカットのみを対象とする意図か、全入力か。
+                                                    #    「マウス複合も含む」とある。
+                                                    #    通常のマウス操作（クリック）が記録されないと困る。
+                                                    #    方針: キー入力を含まない純粋なクリックは常に許可する、または
+                                                    #    ホワイトリストになくても許可する "Pass-through" ロジックにするか？
+                                                    #    -> User Request: "一覧で無効にした入力キーは記録しない"
+                                                    #    -> 裏を返すと、一覧にないものは？ -> Implementation Plan: "White List based"
+                                                    #    -> つまり一覧にないものは記録しない。
+                                                    #    -> したがって "L-Click" も一覧になければ記録しないことになる。
+                                                    #    -> これは使い勝手が悪いかもしれないが、仕様通り実装する。
+                                                    #    -> ただし、デフォルトリストにマウス操作系を入れていないなら、修正が必要かも。
+                                                    #    -> Planでは "Mouse Combinations (Example)" とある。
+                                                    #    -> 安全のため、キー入力が無い(modifiersなし & othersなし)クリック単体は
+                                                    #       常に許可する実装にしておくのが無難か。
+                                                    #       あるいは is_allowed の中で None チェック等はしているので、
+                                                    #       ここでも キー入力がある場合のみチェックを行い、
+                                                    #       キー入力がないクリックはスルー（記録）する。
+                                                    pass
+
+                                        if not keys_info:
+                                             # キー入力なしのクリックのみ -> 常に許可（動作履歴として重要）
+                                             allow = True
+                                        
+                                        if not allow:
+                                            # 記録しない (Noneにする)
+                                            click_info = "None"
+                                            keys_info = []
+
                                     self.trajectory_data.append((
                                         round(now - start_time, 3), 
                                         frame_idx, 
@@ -223,9 +311,9 @@ class ScreenRecorderLogic:
 
         # キー状態の取得
         keys_info = []
-        # 修飾キー
-        if ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000: keys_info.append("Shift")
+        # 修飾キー (Ctrl, Shift, Alt, Win の順 - shortcut_manager.py と合わせる)
         if ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000: keys_info.append("Ctrl")
+        if ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000: keys_info.append("Shift")
         if ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000: keys_info.append("Alt")
         if (ctypes.windll.user32.GetAsyncKeyState(0x5B) & 0x8000) or (ctypes.windll.user32.GetAsyncKeyState(0x5C) & 0x8000):
             keys_info.append("Win")
