@@ -5,7 +5,11 @@
 アプリの操作マニュアルや、ネットワーク・サーバー設定を変更したときの作業報告書作成の効率化のために開発しました。
 
 ## ダウンロード:
- 0.2.3 : [ダウンロード](https://github.com/KotorinChunChun/ChulipVideo/releases/download/v0.2.x/ChulipVideo_v0.2.3-beta.zip)
+ v0.2.3-beta : [ダウンロード](https://github.com/KotorinChunChun/ChulipVideo/releases/download/v0.2.x/ChulipVideo_v0.2.3-beta.zip)
+
+ ベータ版につき多数の不具合が含まれている可能性が高い点だけご承知おきください。
+
+ 不具合報告・機能追加提案などはプルリクまたは[Twitter](https://x.com/KotorinChunChun)までどうぞ
 
 ## 開発者:
  ことりちゅん
