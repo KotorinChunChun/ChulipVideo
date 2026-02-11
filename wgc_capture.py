@@ -64,7 +64,9 @@ class WGCCapture:
             self.session.start_capture()
             # print(f"WGC Capture started for HWND: {self.hwnd}")
         except Exception as e:
-            print(f"WGC Initialization root error: {e}")
+            # WGCが利用できない環境（ライブラリ不足等）では通常のウィンドウキャプチャにフォールバックします
+            # print(f"WGC Initialization root error: {e}")
+            pass
 
     def _create_item_from_hwnd(self, hwnd: int) -> Optional[capture.GraphicsCaptureItem]:
         """ctypes を使用して HWND から GraphicsCaptureItem を作成する."""

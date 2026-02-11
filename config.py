@@ -109,6 +109,12 @@ def load_global_config() -> dict[str, Any]:
             "button_redo_bg": "#B3E5FC",    # 薄い青
             "button_locked_bg": "#FFAB91",   # 薄い赤（ロック中）
             "button_unlocked_bg": "#B9F6CA", # 薄い緑（解除中）
+            "recorder_browse_bg": "#ffe0b2", # 薄いオレンジ
+            "recorder_open_tsv_bg": "#bbdefb", # 薄い青
+            "recorder_key_config_bg": "#FFD700", # 詳細設定と同じオレンジ
+            "recorder_close_bg": "#eeeeee", # 明るいグレー
+            "recorder_install_vcam_bg": "#eeeeee", # 明るいグレー
+            "recorder_play_bg": "#bbdefb",  # 薄い青
             "start_color_bg": "#77BB77",     # 開始カラー
             "end_color_bg": "#FF7777",       # 終了カラー
 

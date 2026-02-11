@@ -388,19 +388,19 @@ class InputHistoryManager:
 
     def update(self, current_time, check_text):
         """現在の入力テキストに基づいて履歴を更新する"""
-        # 入力がない（離された）場合
+        # 入力がない(離された)場合
         if not check_text:
             # 入力が途切れたので直前のキー情報をリセット
             self.last_text = None
             return
 
-        # 直前の入力と同じなら履歴に追加しない（押しっぱなし対策）
-        # 以前は0.2秒などの猶予を持たせていたが、
-        # 「離されるまでは追加表示しない」という要望のため、時間経過に関わらず
-        # 同一テキストが継続している間は無視する。
+        # 直前の入力と同じ場合
         if check_text == self.last_text:
-            # 表示期間（フェードアウト開始時間）の延長を行いたい場合は
-            # ここで last_time を更新する手もあるが、今回は「追加表示の抑制」が主眼。
+            # 同じ入力が続いている場合、最後の履歴のタイムスタンプを更新して表示を維持
+            # これにより、押しっぱなし中も字幕が消えない
+            if self.history and self.history[-1][0] == check_text:
+                # 最後の履歴のタイムスタンプを現在時刻に更新
+                self.history[-1] = (check_text, current_time)
             self.last_time = current_time
             return
 
