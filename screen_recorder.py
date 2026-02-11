@@ -14,6 +14,8 @@ import threading
 import time
 import tkinter as tk
 import tkinter.ttk as ttk
+from utils import open_folder_with_selection
+import glob
 import urllib.request
 import zipfile
 from tkinter import filedialog, messagebox
@@ -32,6 +34,8 @@ from shortcut_settings_dialog import ShortcutSettingsDialog
 from ui_utils import add_tooltip
 from utils import resource_path
 from window_utils import WindowUtils
+from multi_video_player import MultiVideoManager
+
 
 # 仮想カメラライブラリのインポート試行
 try:
@@ -338,6 +342,11 @@ class ScreenRecorderApp:
         self.preview_independent_var = tk.BooleanVar(value=False) # 独立プレビューフラグ
         self.last_independent_preview_pos = "+0+0" # セッション内の表示座標
         
+        # タイマー設定
+        self.countdown_var = tk.IntVar(value=3)
+        self.max_duration_var = tk.IntVar(value=0)
+        self.recording_start_time = 0.0
+        
         # プレイヤー/プレビューのパン・ズーム用
         self.player_zoom = 1.0
         self.player_pan_x = 0
@@ -364,6 +373,11 @@ class ScreenRecorderApp:
         self.monitors: List[Dict[str, Any]] = []
         self.windows: List[Tuple[Any, str, str, int]] = []
         self.file_items: List[str] = []
+        
+        # マルチビデオ管理
+        self.multi_video_manager: Optional[MultiVideoManager] = None
+        self.is_multi_view = False
+
 
     def _load_config(self):
         """設定読み込み"""
@@ -535,11 +549,15 @@ class ScreenRecorderApp:
         self.btn_rename.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         self.btn_delete = tk.Button(list_ctrl, text="削除", command=self.delete_file, state=tk.DISABLED, height=1, bg=self.COLOR_BTN_DELETE)
         self.btn_delete.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        # フォルダを開くボタン
+        self.btn_open_folder = tk.Button(list_ctrl, text="保存フォルダを開く", command=lambda: open_folder_with_selection(self.save_path_var.get()))
+        self.btn_open_folder.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         
         self.btn_open_tsv = tk.Button(list_ctrl, text="操作ログを開く", command=self.open_tsv_file, state=tk.DISABLED, height=1, bg=self.theme.get("recorder_open_tsv_bg"))
         self.btn_open_tsv.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         
-        self.widgets_to_lock.extend([self.btn_rename, self.btn_delete, self.btn_open_tsv])
+        self.widgets_to_lock.extend([self.btn_rename, self.btn_delete, self.btn_open_folder, self.btn_open_tsv])
         self._fix_all_button_active_colors(path_frame)
         self._fix_all_button_active_colors(list_ctrl)
 
@@ -578,30 +596,34 @@ class ScreenRecorderApp:
         self.refresh_file_list()
 
     def _setup_recording_tab(self):
-        # 1. ソース選択
+        # 1. ソース選択 (録画対象フレーム)
         source_frame = tk.LabelFrame(self.tab_record, text="録画対象")
         source_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        self.radio_desktop = tk.Radiobutton(source_frame, text="デスクトップ", variable=self.source_var, 
+        # 1-1. デスクトップ/ウィンドウ切り替え
+        type_frame = tk.Frame(source_frame)
+        type_frame.pack(fill=tk.X, padx=5, pady=2)
+        
+        self.radio_desktop = tk.Radiobutton(type_frame, text="デスクトップ", variable=self.source_var, 
                        value="desktop", command=self.update_source_list)
         self.radio_desktop.pack(side=tk.LEFT, padx=10)
-        self.radio_window = tk.Radiobutton(source_frame, text="ウィンドウ", variable=self.source_var, 
+        self.radio_window = tk.Radiobutton(type_frame, text="ウィンドウ", variable=self.source_var, 
                        value="window", command=self.update_source_list)
         self.radio_window.pack(side=tk.LEFT, padx=10)
         self.widgets_to_lock.extend([self.radio_desktop, self.radio_window])
         
-        # 2. フィルター
-        filter_frame = tk.Frame(self.tab_record)
-        filter_frame.pack(fill=tk.X, padx=10, pady=0)
+        # 1-2. フィルター
+        filter_frame = tk.Frame(source_frame)
+        filter_frame.pack(fill=tk.X, padx=5, pady=2)
         tk.Label(filter_frame, text="検索:").pack(side=tk.LEFT)
         self.filter_var.trace_add("write", lambda *args: self.update_source_list())
         self.entry_filter = tk.Entry(filter_frame, textvariable=self.filter_var)
         self.entry_filter.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         self.widgets_to_lock.append(self.entry_filter)
 
-        # 3. ターゲット選択
-        target_frame = tk.Frame(self.tab_record)
-        target_frame.pack(fill=tk.X, padx=10, pady=5)
+        # 1-3. ターゲット選択
+        target_frame = tk.Frame(source_frame)
+        target_frame.pack(fill=tk.X, padx=5, pady=2)
         tk.Label(target_frame, text="対象:").pack(side=tk.LEFT)
         self.combo_target = ttk.Combobox(target_frame, textvariable=self.target_var, state="readonly")
         self.combo_target.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
@@ -610,9 +632,9 @@ class ScreenRecorderApp:
         self.btn_update.pack(side=tk.LEFT)
         self.widgets_to_lock.extend([self.btn_update, self.combo_target])
 
-        # 3.5 座標・サイズ入力
-        geo_frame = tk.Frame(self.tab_record)
-        geo_frame.pack(fill=tk.X, padx=10, pady=2)
+        # 1-4. 座標・サイズ入力
+        geo_frame = tk.Frame(source_frame)
+        geo_frame.pack(fill=tk.X, padx=5, pady=2)
         
         self.geo_x = tk.IntVar()
         self.geo_y = tk.IntVar()
@@ -685,14 +707,37 @@ class ScreenRecorderApp:
         settings_frame = tk.Frame(self.tab_record)
         settings_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        tk.Label(settings_frame, text="FPS:").pack(side=tk.LEFT)
+        tk.Label(settings_frame, text="フォーマット:").pack(side=tk.LEFT)
+        self.format_var = tk.StringVar(value="mp4")
+        self.combo_format = ttk.Combobox(settings_frame, textvariable=self.format_var, values=["mp4", "mkv"], width=5, state="readonly")
+        self.combo_format.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(settings_frame, text="FPS:").pack(side=tk.LEFT, padx=(10, 0))
         self.combo_fps = ttk.Combobox(settings_frame, textvariable=self.fps_var, values=[15, 30, 60], width=5, state="readonly")
         self.combo_fps.pack(side=tk.LEFT, padx=5)
         
         tk.Label(settings_frame, text="画質:").pack(side=tk.LEFT, padx=(10, 0))
         self.combo_quality = ttk.Combobox(settings_frame, textvariable=self.quality_var, values=["最高", "高", "中", "低"], width=5, state="readonly")
         self.combo_quality.pack(side=tk.LEFT, padx=5)
-        self.widgets_to_lock.extend([self.combo_fps, self.combo_quality])
+        self.widgets_to_lock.extend([self.combo_format, self.combo_fps, self.combo_quality])
+
+        # 5.5 タイマー設定
+        timer_frame = tk.Frame(self.tab_record)
+        timer_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        tk.Label(timer_frame, text="開始カウントダウン(秒):").pack(side=tk.LEFT)
+        self.spin_countdown = tk.Spinbox(timer_frame, from_=0, to=60, textvariable=self.countdown_var, width=5)
+        self.spin_countdown.pack(side=tk.LEFT, padx=5)
+        
+        tk.Label(timer_frame, text="最長録画時間(秒):").pack(side=tk.LEFT, padx=(10, 0))
+        self.spin_max_duration = tk.Spinbox(timer_frame, from_=0, to=36000, textvariable=self.max_duration_var, width=6)
+        self.spin_max_duration.pack(side=tk.LEFT, padx=5)
+        tk.Label(timer_frame, text="(0で無制限)").pack(side=tk.LEFT)
+        
+        self.lbl_timer_info = tk.Label(timer_frame, text="", fg="blue")
+        self.lbl_timer_info.pack(side=tk.LEFT, padx=10)
+        
+        self.widgets_to_lock.extend([self.spin_countdown, self.spin_max_duration])
 
         # 6. オプション
         options_frame = tk.Frame(self.tab_record)
@@ -724,10 +769,6 @@ class ScreenRecorderApp:
                                                         relief=tk.RAISED, overrelief=tk.RIDGE)
         self.check_preview_independent.pack(side=tk.LEFT, padx=5, ipadx=5)
         self.widgets_to_lock.append(self.check_preview_independent)
-        
-        # self.btn_shortcut_settings = tk.Button(options_frame, text="キー設定", command=self.open_shortcut_settings, height=1)
-        # self.btn_shortcut_settings.pack(side=tk.LEFT, padx=10)
-        # self.widgets_to_lock.append(self.btn_shortcut_settings)
 
         # 7. 録画ボタンエリア
         btn_frame = tk.Frame(self.tab_record)
@@ -749,15 +790,24 @@ class ScreenRecorderApp:
         self._fix_all_button_active_colors(self.tab_record)
 
     def _setup_playback_tab(self):
+        # Controls at bottom (Fixed Height)
+        p_btns_container = tk.Frame(self.tab_play, height=80) 
+        p_btns_container.pack_propagate(False) # 固定高さ
+        p_btns_container.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 10))
+
+        # Player frame takes remaining space
         player_frame = tk.LabelFrame(self.tab_play, text="プレイヤー")
-        player_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        player_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=10)
         
+        # プレイヤー表示エリア (Single / Multi 切り替え用)
+        # Single View Canvas (Child of player_frame)
         self.player_canvas = tk.Canvas(player_frame, bg=self.COLOR_CANVAS_BG, highlightthickness=0)
         self.player_canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.player_canvas.bind("<Configure>", lambda e: self._on_canvas_resize("player"))
         
-        p_btns_container = tk.Frame(self.tab_play)
-        p_btns_container.pack(fill=tk.X, padx=10, pady=(0, 10))
+        # Multi View Container (Child of player_frame, initially hidden)
+        self.player_multi_container = tk.Frame(player_frame, bg=self.COLOR_CANVAS_BG)
+        # Don't pack initially
 
         p_btns = tk.Frame(p_btns_container)
         p_btns.pack(fill=tk.X, pady=2)
@@ -778,10 +828,6 @@ class ScreenRecorderApp:
 
         self.chk_player_fit = tk.Checkbutton(p_btns_container, text="プレビューを拡大・縮小する", variable=self.player_fit_var, command=self.refresh_player_canvas)
         self.chk_player_fit.pack(side=tk.RIGHT, padx=5)
-        
-        # 再生タブにもキー設定ボタン
-        self.btn_play_key_config = tk.Button(p_btns_container, text="キー設定", command=self.open_shortcut_settings, height=1)
-        self.btn_play_key_config.pack(side=tk.RIGHT, padx=5)
 
         # 全体の配色微調整
         self._fix_all_button_active_colors(self.tab_play)
@@ -880,6 +926,8 @@ class ScreenRecorderApp:
                 self.target_var.set("")
             
             self.entry_filter.config(state=tk.DISABLED)
+            self.check_max_geo.config(state=tk.DISABLED)
+            self.max_geo_var.set(False)
             for w in [self.spin_x, self.spin_y, self.spin_w, self.spin_h, self.btn_apply_geo, self.check_sync_geo]:
                 w.config(state=tk.DISABLED)
                 
@@ -895,6 +943,7 @@ class ScreenRecorderApp:
                 self.target_var.set("")
             
             self.entry_filter.config(state=tk.NORMAL)
+            self.check_max_geo.config(state=tk.NORMAL)
             for w in [self.spin_x, self.spin_y, self.spin_w, self.spin_h, self.check_sync_geo]:
                 w.config(state=tk.NORMAL)
             self._on_sync_changed()
@@ -1073,8 +1122,19 @@ class ScreenRecorderApp:
                     if capture_success and img:
                         # --- プレビュー演出 (オーバーレイ) の描画 (リサイズ前の元画像に行う) ---
                         if self.show_preview_overlay_var.get():
-                            # 現在の入力状態を取得
-                            click_info, keys_info = self.recorder_logic._get_input_state()
+                            # ターゲット情報取得
+                            target_hwnd = None
+                            is_wgc = False
+                            if self.source_var.get() == 'window':
+                                idx = self.combo_target.current()
+                                if idx >= 0 and idx < len(self.windows):
+                                    target_hwnd = self.windows[idx][0]
+                                if self.exclusive_window_var.get():
+                                    is_wgc = True
+
+                            # 現在の入力状態取得 (フィルタリング済み)
+                            # is_wgc は True/False (get_filtered_input_state 内では Truthy チェックのみに使用されるため bool で可)
+                            click_info, keys_info, rel_x, rel_y = self.recorder_logic.get_filtered_input_state(rect, target_hwnd, is_wgc)
                             keys_str = ",".join(keys_info) if keys_info else "None"
                             now_ts = time.time()
                             
@@ -1104,47 +1164,34 @@ class ScreenRecorderApp:
                                     ripple_age = 0.0
                             
                             self.last_mouse_state = click_info
-                            # 3. 描画座標計算 (元画像のピクセル座標)
-                            pt = ctypes.wintypes.POINT()
-                            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-                            rel_x = pt.x - rect['left']
-                            rel_y = pt.y - rect['top']
 
                             # --- 演出（オーバーレイ）の描画 ---
-                            if self.show_preview_overlay_var.get():
-                                # WGCかつウィンドウ録画時のみ、アクティブウィンドウチェックを行う
-                                is_wgc = (self.source_var.get() == "window" and self.exclusive_window_var.get())
-                                should_draw_overlay = True
-                                if is_wgc:
-                                    # 録画対象のウィンドウが最前面のときのみ演出を表示
-                                    target_hwnd = None
-                                    idx = self.combo_target.current()
-                                    if idx >= 0 and idx < len(self.windows):
-                                        target_hwnd = self.windows[idx][0]
-                                    
-                                    fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
-                                    if fg_hwnd != target_hwnd:
-                                        should_draw_overlay = False
+                            # WGCかつウィンドウ録画時、アクティブウィンドウが対象と異なれば完全に非表示（ホバーなども消す）
+                            should_draw_overlay = True
+                            if is_wgc and target_hwnd:
+                                fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+                                if fg_hwnd != target_hwnd:
+                                    should_draw_overlay = False
 
-                                if should_draw_overlay:
-                                    # マウスオーバーレイ描画
-                                    overlay_utils.draw_mouse_overlay(
-                                        img, rel_x, rel_y, click_info,
-                                        1.0, 1.0,
-                                        self.theme,
-                                        ripple_age=ripple_age,
-                                        ripple_type=ripple_type
-                                    )
-                                    
-                                    # キー履歴オーバーレイ描画
-                                    active_inputs = self.preview_input_manager.get_active_inputs(
-                                        now_ts, self.theme.get("input_overlay", {}).get("fade_duration", 1.0)
-                                    )
-                                    overlay_utils.draw_input_overlay(
-                                        img, active_inputs,
-                                        1.0, 1.0,
-                                        self.theme
-                                    )
+                            if should_draw_overlay:
+                                # マウスオーバーレイ描画
+                                overlay_utils.draw_mouse_overlay(
+                                    img, rel_x, rel_y, click_info,
+                                    1.0, 1.0,
+                                    self.theme,
+                                    ripple_age=ripple_age,
+                                    ripple_type=ripple_type
+                                )
+                                
+                                # キー履歴オーバーレイ描画
+                                active_inputs = self.preview_input_manager.get_active_inputs(
+                                    now_ts, self.theme.get("input_overlay", {}).get("fade_duration", 1.0)
+                                )
+                                overlay_utils.draw_input_overlay(
+                                    img, active_inputs,
+                                    1.0, 1.0,
+                                    self.theme
+                                )
 
                         # --- 表示処理 (独立ウィンドウ or 本体Canvas) ---
                         try:
@@ -1288,15 +1335,26 @@ class ScreenRecorderApp:
             messagebox.showerror("Error", "録画対象が取得できません", parent=self.root)
             return
             
-        self.is_counting_down = True
-        # 録画開始ボタンを押した瞬間にUIをロック
-        self._set_controls_state(tk.DISABLED)
-
-        # カウントダウン表示 -> 終了後に start_recording 実行
-        self._show_countdown(3, self.start_recording)
+        count = self.countdown_var.get()
+        if count > 0:
+            self.is_counting_down = True
+            # 録画開始ボタンを押した瞬間にUIをロック (ボタンはStopスタイルになる)
+            self._set_controls_state(tk.DISABLED)
+            
+            # カウントダウン表示 -> 終了後に start_recording 実行
+            self._show_countdown(count, self.start_recording)
+        else:
+            # カウントダウンなしで即開始
+            self.start_recording()
 
     def _show_countdown(self, count, callback):
         """画面中央にカウントダウンを表示"""
+        # ボタン表示を更新
+        try:
+            self.btn_record.config(text=f"中止 (残り{count}秒)")
+        except:
+            pass
+            
         if count > 0:
             # オーバーレイウィンドウ作成（透過）
             w = tk.Toplevel(self.root)
@@ -1357,6 +1415,7 @@ class ScreenRecorderApp:
 
     def start_recording(self):
         self.is_counting_down = False
+        self.recording_start_time = time.time()
 
         rect = self._get_target_rect()
         if not rect:
@@ -1377,7 +1436,8 @@ class ScreenRecorderApp:
 
         # ファイル名
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{now}.mp4"
+        ext = self.format_var.get()
+        filename = f"{now}.{ext}"
         filepath = os.path.join(self.save_path_var.get(), filename)
         
         fps = self.fps_var.get()
@@ -1403,9 +1463,37 @@ class ScreenRecorderApp:
         is_in_record_tab = (self.notebook.select() == str(self.tab_record))
         is_recording = self.recorder_logic.is_recording
         
-        # 実際に枠を表示するかどうか
         # show_region_var が OFF の場合は即座に消す
         should_show = self.show_region_var.get() and (is_recording or is_in_record_tab)
+        
+        # 自動停止チェック & 残り時間表示
+        if is_recording:
+            max_dur = self.max_duration_var.get()
+            if max_dur > 0:
+                elapsed = time.time() - self.recording_start_time
+                remaining = max(0, max_dur - int(elapsed))
+                
+                # 終了予定時刻
+                finish_time = datetime.datetime.fromtimestamp(self.recording_start_time + max_dur)
+                finish_str = finish_time.strftime("%H:%M:%S")
+                
+                # MM:SS 形式 (必要なら HH:MM:SS)
+                rem_m, rem_s = divmod(remaining, 60)
+                rem_h, rem_m = divmod(rem_m, 60)
+                if rem_h > 0:
+                    rem_str = f"{rem_h}:{rem_m:02}:{rem_s:02}"
+                else:
+                    rem_str = f"{rem_m:02}:{rem_s:02}"
+                
+                self.lbl_timer_info.config(text=f"残り: {rem_str} (終了: {finish_str})")
+
+                if elapsed >= max_dur:
+                    self.stop_recording()
+                    return
+            else:
+                self.lbl_timer_info.config(text="")
+        else:
+            self.lbl_timer_info.config(text="")
         
         if not self.show_region_var.get():
             self._hide_recording_region()
@@ -1809,7 +1897,7 @@ class ScreenRecorderApp:
         if os.path.exists(d):
             files_info = []
             for f in os.listdir(d):
-                if f.lower().endswith(".mp4"):
+                if f.lower().endswith((".mp4", ".mkv")):
                     path = os.path.join(d, f)
                     try:
                         mtime = os.path.getmtime(path)
@@ -1863,15 +1951,24 @@ class ScreenRecorderApp:
                 self.btn_open_tsv.config(state=tk.NORMAL)
             else:
                 self.btn_open_tsv.config(state=tk.DISABLED)
-                
-            self.stop_playback()
-            self.load_video_for_playback()
+            
+            # 複数選択チェック
+            if len(idx) > 1:
+                self.is_multi_view = True
+                self._switch_to_multi_view(idx)
+            else:
+                self.is_multi_view = False
+                self._switch_to_single_view()
+                self.stop_playback()
+                self.load_video_for_playback()
         else:
             self.btn_rename.config(state=tk.DISABLED)
             self.btn_delete.config(state=tk.DISABLED)
             self.btn_play.config(state=tk.DISABLED)
             self.btn_open_tsv.config(state=tk.DISABLED)
             self.stop_playback()
+            self.is_multi_view = False
+            self._switch_to_single_view()
             self.clear_player_canvas()
 
     def on_file_double_click(self, event):
@@ -1885,6 +1982,7 @@ class ScreenRecorderApp:
     def rename_file(self):
         indices = self.file_listbox.curselection()
         if not indices: return
+        indices = [int(i) for i in indices]
         
         is_multiple = len(indices) > 1
         title = "一括名前変更 (接頭辞付与)" if is_multiple else "名前変更"
@@ -1921,6 +2019,12 @@ class ScreenRecorderApp:
             if self.cap:
                 self.cap.release()
                 self.cap = None
+            if self.multi_video_manager:
+                self.multi_video_manager.release()
+                # self.multi_video_manager = None # インスタンスは保持してもいいが、再ロード必要
+                # 安全のため再生成させるフローにするか、releaseだけで十分か
+                # MultiVideoManager.release() が cap.release() していればOK
+
 
             success_count = 0
             for i in indices:
@@ -1975,6 +2079,7 @@ class ScreenRecorderApp:
     def delete_file(self):
         indices = self.file_listbox.curselection()
         if not indices: return
+        indices = [int(i) for i in indices]
         
         count = len(indices)
         msg = f"{count} 個のアイテムを削除しますか？" if count > 1 else f"{self.file_items[indices[0]]} を削除しますか？"
@@ -1984,6 +2089,9 @@ class ScreenRecorderApp:
             if self.cap:
                 self.cap.release()
                 self.cap = None
+            if self.multi_video_manager:
+                self.multi_video_manager.release()
+
 
             success_count = 0
             for i in sorted(indices, reverse=True):
@@ -2010,7 +2118,64 @@ class ScreenRecorderApp:
         self.lbl_time.config(text="00:00 / 00:00")
         self.seek_var.set(0)
 
+    def _switch_to_single_view(self):
+        """シングルビューへの切り替え"""
+        if self.multi_video_manager:
+            self.multi_video_manager.release()
+            self.multi_video_manager = None
+            
+        # Hide Multi
+        self.player_multi_container.pack_forget()
+        
+        # Show Single
+        if not self.player_canvas.winfo_ismapped():
+            self.player_canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+        # UI controls update
+        self.chk_player_traj.config(state=tk.NORMAL)
+        self.chk_player_fit.config(state=tk.NORMAL)
+
+    def _switch_to_multi_view(self, indices):
+        """マルチビューへの切り替え"""
+        self.stop_playback()
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+            
+        # Hide Single
+        self.player_canvas.pack_forget()
+        
+        # Show Multi
+        self.player_multi_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # 選択されたファイルのパスリスト作成
+        paths = []
+        for i in indices:
+            fname = self.file_items[i]
+            paths.append(os.path.join(self.save_dir, fname))
+            
+        # MultiVideoManager初期化
+        if self.multi_video_manager:
+            self.multi_video_manager.release()
+            
+        self.multi_video_manager = MultiVideoManager(self.player_multi_container, paths)
+        self.multi_video_manager.set_callback(self._on_multi_video_state_change)
+        
+        # グローバルコントロールの初期化
+        
+        # グローバルコントロールの初期化
+        # Initial label
+        self.lbl_time.config(text=self.multi_video_manager.get_current_time_str())
+        self.seek_var.set(0)
+        self.slider.config(to=100)
+        
+        # UI controls update
+        self.chk_player_traj.config(state=tk.DISABLED) # Overlay not supported in multi yet
+        self.chk_player_fit.config(state=tk.DISABLED)
+
     def load_video_for_playback(self):
+        if self.is_multi_view: return
+
         idx = self.file_listbox.curselection()
         if not idx: return
         fname = self.file_items[idx[0]]
@@ -2066,6 +2231,14 @@ class ScreenRecorderApp:
             self.start_playback()
 
     def start_playback(self):
+        if self.is_multi_view:
+            if self.multi_video_manager:
+                self.multi_video_manager.play_all()
+                self.is_playing = True
+                self.btn_play.config(text="Ⅱ")
+                self.playback_loop()
+            return
+
         if not self.cap or not self.cap.isOpened():
             return
         
@@ -2078,16 +2251,53 @@ class ScreenRecorderApp:
         self.playback_loop()
 
     def stop_playback(self):
+        if self.is_multi_view:
+            if self.multi_video_manager:
+                self.multi_video_manager.stop_all()
+        
         self.is_playing = False
         self.btn_play.config(text="▶")
         if self.playback_after_id:
             self.root.after_cancel(self.playback_after_id)
             self.playback_after_id = None
 
+    def _on_multi_video_state_change(self, is_playing):
+        """個別の動画が再生されたときにループを回す"""
+        if is_playing and not self.playback_after_id:
+            self.start_playback_loop_only()
+
+    def start_playback_loop_only(self):
+        """ループだけ回す (Global Play状態にはしない)"""
+        if not self.playback_after_id:
+            self.playback_loop()
+
     def playback_loop(self):
-        if not self.is_playing or not self.cap:
+        # Multi-View Loop check first
+        if self.is_multi_view and self.multi_video_manager:
+             is_running = self.multi_video_manager.on_global_step()
+             if is_running:
+                 # Update slider only if Global Playing
+                 if self.multi_video_manager.is_global_playing and not self.user_dragging_slider:
+                     ratio = self.multi_video_manager.get_progress_ratio()
+                     self.seek_var.set(ratio * 100)
+                 
+                 self.lbl_time.config(text=self.multi_video_manager.get_current_time_str())
+                 self.playback_after_id = self.root.after(33, self.playback_loop)
+             else:
+                 self.playback_after_id = None
+                 if self.multi_video_manager.is_global_playing:
+                     self.stop_playback()
+             return
+
+        if not self.is_playing:
+            return
+
+        if not self.cap:
             return
             
+        # 処理開始時間を記録 (ドリフト補正用)
+        loop_start = time.time()
+        
         ret, frame = self.cap.read()
         if ret:
             curr_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
@@ -2096,8 +2306,14 @@ class ScreenRecorderApp:
                 self.seek_var.set(curr_frame)
             self.update_time_label(curr_frame)
             
-            delay = int(1000 / self.video_fps) if self.video_fps > 0 else 33
-            self.playback_after_id = self.root.after(delay, self.playback_loop)
+            # 処理時間を考慮した待機時間を計算
+            elapsed = time.time() - loop_start
+            target_delay = 1.0 / self.video_fps if self.video_fps > 0 else 0.033
+            wait_s = target_delay - elapsed
+            if wait_s < 0:
+                wait_s = 0
+            
+            self.playback_after_id = self.root.after(int(wait_s * 1000), self.playback_loop)
         else:
             self.stop_playback()
 
@@ -2343,14 +2559,29 @@ class ScreenRecorderApp:
 
     def on_slider_move(self, value):
         if self.user_dragging_slider:
-            val = int(float(value))
-            self.show_frame(val)
-            self.update_time_label(val)
+            val = float(value)
+            if self.is_multi_view and self.multi_video_manager:
+                 ratio = val / 100.0
+                 self.multi_video_manager.seek_all_by_ratio(ratio)
+            else:
+                 val = int(val)
+                 self.show_frame(val)
+                 self.update_time_label(val)
 
     def on_slider_release(self, event):
         self.user_dragging_slider = False
-        val = int(self.seek_var.get())
-        self.show_frame(val)
+        val = float(self.seek_var.get())
+        
+        if self.is_multi_view and self.multi_video_manager:
+            # Multi View Seek
+            # Slider is 0-100 ratio
+            ratio = val / 100.0
+            self.multi_video_manager.seek_all_by_ratio(ratio)
+        else:
+            # Single View Seek
+            val = int(val)
+            self.show_frame(val)
+            
         if hasattr(self, 'was_playing_before_drag') and self.was_playing_before_drag:
             self.start_playback()
 

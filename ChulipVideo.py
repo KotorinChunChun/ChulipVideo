@@ -180,47 +180,47 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
         self._play_after_id = None
         # スペースキーをどのウィジェットにフォーカスがあっても捕まえる
-        self.root.bind_all("<space>", lambda e: not self.suppress_shortcuts and self.toggle_play())
+        self.root.bind_all("<space>", lambda e: self._should_trigger_shortcut() and self.toggle_play())
         # Undo with Ctrl+Z
-        self.root.bind_all("<Control-z>", lambda e: not self.suppress_shortcuts and self.undo_crop())
-        self.root.bind_all("<Control-Z>", lambda e: not self.suppress_shortcuts and self.undo_crop())
+        self.root.bind_all("<Control-z>", lambda e: self._should_trigger_shortcut() and self.undo_crop())
+        self.root.bind_all("<Control-Z>", lambda e: self._should_trigger_shortcut() and self.undo_crop())
         # Copy crop to clipboard with Ctrl+C
-        self.root.bind_all("<Control-c>", lambda e: not self.suppress_shortcuts and self.copy_crop_to_clipboard())
-        self.root.bind_all("<Control-C>", lambda e: not self.suppress_shortcuts and self.copy_crop_to_clipboard())
+        self.root.bind_all("<Control-c>", lambda e: self._should_trigger_shortcut() and self.copy_crop_to_clipboard())
+        self.root.bind_all("<Control-C>", lambda e: self._should_trigger_shortcut() and self.copy_crop_to_clipboard())
         # Redo with Ctrl+Y
-        self.root.bind_all("<Control-y>", lambda e: not self.suppress_shortcuts and self.redo_crop())
-        self.root.bind_all("<Control-Y>", lambda e: not self.suppress_shortcuts and self.redo_crop())
+        self.root.bind_all("<Control-y>", lambda e: self._should_trigger_shortcut() and self.redo_crop())
+        self.root.bind_all("<Control-Y>", lambda e: self._should_trigger_shortcut() and self.redo_crop())
         # Arrow key repeat handlers (Left/Right)
         self._arrow_repeat_id = None
         self._arrow_dir = None
         self._arrow_start_time = None
-        self.root.bind_all('<KeyPress-Left>', lambda e: not self.suppress_shortcuts and self._on_arrow_press(e, -1))
-        self.root.bind_all('<KeyRelease-Left>', lambda e: not self.suppress_shortcuts and self._on_arrow_release(e))
-        self.root.bind_all('<KeyPress-Right>', lambda e: not self.suppress_shortcuts and self._on_arrow_press(e, 1))
-        self.root.bind_all('<KeyRelease-Right>', lambda e: not self.suppress_shortcuts and self._on_arrow_release(e))
+        self.root.bind_all('<KeyPress-Left>', lambda e: self._should_trigger_shortcut() and self._on_arrow_press(e, -1))
+        self.root.bind_all('<KeyRelease-Left>', lambda e: self._should_trigger_shortcut() and self._on_arrow_release(e))
+        self.root.bind_all('<KeyPress-Right>', lambda e: self._should_trigger_shortcut() and self._on_arrow_press(e, 1))
+        self.root.bind_all('<KeyRelease-Right>', lambda e: self._should_trigger_shortcut() and self._on_arrow_release(e))
         # Alt+矢印でクロップ矩形を移動（Ctrl併用で10px）
-        self.root.bind_all('<Alt-Up>', lambda e: (self.move_crop_by(0, -10 if (e.state & 0x4) else -1) or "break"))
-        self.root.bind_all('<Alt-Down>', lambda e: (self.move_crop_by(0, 10 if (e.state & 0x4) else 1) or "break"))
-        self.root.bind_all('<Alt-Left>', lambda e: (self.move_crop_by(-10 if (e.state & 0x4) else -1, 0) or "break"))
-        self.root.bind_all('<Alt-Right>', lambda e: (self.move_crop_by(10 if (e.state & 0x4) else 1, 0) or "break"))
+        self.root.bind_all('<Alt-Up>', lambda e: self._should_trigger_shortcut() and (self.move_crop_by(0, -10 if (e.state & 0x4) else -1) or "break"))
+        self.root.bind_all('<Alt-Down>', lambda e: self._should_trigger_shortcut() and (self.move_crop_by(0, 10 if (e.state & 0x4) else 1) or "break"))
+        self.root.bind_all('<Alt-Left>', lambda e: self._should_trigger_shortcut() and (self.move_crop_by(-10 if (e.state & 0x4) else -1, 0) or "break"))
+        self.root.bind_all('<Alt-Right>', lambda e: self._should_trigger_shortcut() and (self.move_crop_by(10 if (e.state & 0x4) else 1, 0) or "break"))
         # Shift+矢印でクロップ矩形を拡大縮小（Ctrl併用で10px）
-        self.root.bind_all('<Shift-Up>', lambda e: (self.expand_crop(0, 10 if (e.state & 0x4) else 1) or "break"))
-        self.root.bind_all('<Shift-Down>', lambda e: (self.expand_crop(0, -10 if (e.state & 0x4) else -1) or "break"))
-        self.root.bind_all('<Shift-Left>', lambda e: (self.expand_crop(-10 if (e.state & 0x4) else -1, 0) or "break"))
-        self.root.bind_all('<Shift-Right>', lambda e: (self.expand_crop(10 if (e.state & 0x4) else 1, 0) or "break"))
+        self.root.bind_all('<Shift-Up>', lambda e: self._should_trigger_shortcut() and (self.expand_crop(0, 10 if (e.state & 0x4) else 1) or "break"))
+        self.root.bind_all('<Shift-Down>', lambda e: self._should_trigger_shortcut() and (self.expand_crop(0, -10 if (e.state & 0x4) else -1) or "break"))
+        self.root.bind_all('<Shift-Left>', lambda e: self._should_trigger_shortcut() and (self.expand_crop(-10 if (e.state & 0x4) else -1, 0) or "break"))
+        self.root.bind_all('<Shift-Right>', lambda e: self._should_trigger_shortcut() and (self.expand_crop(10 if (e.state & 0x4) else 1, 0) or "break"))
         # Home/End bindings
-        self.root.bind_all('<Home>', lambda e: not self.suppress_shortcuts and self.set_current_time_direct(self.start_time))
-        self.root.bind_all('<End>', lambda e: not self.suppress_shortcuts and self.set_current_time_direct(self.end_time))
-        self.root.bind_all('<Control-Home>', lambda e: not self.suppress_shortcuts and self.set_current_time_direct(0))
-        self.root.bind_all('<Control-End>', lambda e: not self.suppress_shortcuts and self.set_current_time_direct(self.duration))
+        self.root.bind_all('<Home>', lambda e: self._should_trigger_shortcut() and self.set_current_time_direct(self.start_time))
+        self.root.bind_all('<End>', lambda e: self._should_trigger_shortcut() and self.set_current_time_direct(self.end_time))
+        self.root.bind_all('<Control-Home>', lambda e: self._should_trigger_shortcut() and self.set_current_time_direct(0))
+        self.root.bind_all('<Control-End>', lambda e: self._should_trigger_shortcut() and self.set_current_time_direct(self.duration))
         # Ctrl+Sで現在のクロップ範囲をPNGとして保存
-        self.root.bind_all('<Control-s>', lambda e: not self.suppress_shortcuts and self.save_current_frame_as_png())
-        self.root.bind_all('<Control-S>', lambda e: not self.suppress_shortcuts and self.save_current_frame_as_png())
+        self.root.bind_all('<Control-s>', lambda e: self._should_trigger_shortcut() and self.save_current_frame_as_png())
+        self.root.bind_all('<Control-S>', lambda e: self._should_trigger_shortcut() and self.save_current_frame_as_png())
         
         # マウスの4, 5ボタン (戻る/進む) -> -1s, +1s
         # Windows の Tkinter では一般に Button-4, Button-5 がサイドボタンに割り当てられます
-        self.root.bind_all("<Button-4>", lambda e: not self.suppress_shortcuts and self.adjust_time(lambda: self.current_time, self.set_current_time_direct, -1))
-        self.root.bind_all("<Button-5>", lambda e: not self.suppress_shortcuts and self.adjust_time(lambda: self.current_time, self.set_current_time_direct, 1))
+        self.root.bind_all("<Button-4>", lambda e: self._should_trigger_shortcut() and self.adjust_time(lambda: self.current_time, self.set_current_time_direct, -1))
+        self.root.bind_all("<Button-5>", lambda e: self._should_trigger_shortcut() and self.adjust_time(lambda: self.current_time, self.set_current_time_direct, 1))
 
         # ウィンドウ終了時に設定を保存
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
@@ -240,6 +240,24 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
         # ショートカット抑制フラグ (詳細設定でのテスト用)
         self.suppress_shortcuts = False
+
+    def _should_trigger_shortcut(self) -> bool:
+        """ショートカットキーイベントを処理すべきか判定する (別ウィンドウにフォーカスがある場合は無視)"""
+        if self.suppress_shortcuts:
+            return False
+            
+        # 現在フォーカスを持っているウィジェットを取得
+        focused = self.root.focus_get()
+        if focused:
+            try:
+                # そのウィジェットが属しているトップレベルウィンドウを取得
+                top = focused.winfo_toplevel()
+                # メインウィンドウ(root)でない場合はショートカットを無視
+                if top != self.root:
+                    return False
+            except Exception:
+                pass
+        return True
 
     # ---------------- UI Construction ----------------
     def build_ui(self):

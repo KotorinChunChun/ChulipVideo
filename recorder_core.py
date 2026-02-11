@@ -87,6 +87,127 @@ class ScreenRecorderLogic:
 
         threading.Thread(target=_save_worker, args=(data_to_save,)).start()
 
+    def get_filtered_input_state(
+        self,
+        rect: Dict[str, int],
+        hwnd: Optional[Any] = None,
+        wgc: Optional[Any] = None
+    ) -> tuple[str, List[str], int, int]:
+        """
+        現在の入力状態を取得し、録画設定に基づいてフィルタリングを行った結果を返す.
+        
+        Args:
+            rect: 録画対象の矩形 (left, top, width, height)
+            hwnd: 録画対象のウィンドウハンドル (デスクトップ録画時はNone)
+            wgc: WGCキャプチャインスタンス (任意)
+            
+        Returns:
+            (click_info, keys_info, rel_x, rel_y)
+            - click_info: "L", "R", "L,R", "None" など
+            - keys_info: ["Ctrl", "A"] など
+            - rel_x, rel_y: 録画領域内の相対座標
+        """
+        # マウス座標取得 (screen relative)
+        pt = ctypes.wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        cursor_x, cursor_y = pt.x, pt.y
+        
+        # 動画内相対座標の計算
+        rel_x = cursor_x - rect['left']
+        rel_y = cursor_y - rect['top']
+        w = rect['width']
+        h = rect['height']
+
+        # ベースとなる入力取得
+        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        
+        # WGCかつウィンドウ録画時のみ、アクティブウィンドウチェックを行う
+        # アクティブでなければ入力は一切記録しない ("None", [])
+        if wgc and hwnd:
+            if fg_hwnd != hwnd:
+                return "None", [], rel_x, rel_y
+
+        click_info, keys_info = self._get_input_state()
+        is_desktop_recording = (hwnd is None)
+
+        # --- デスクトップ録画時のフィルタリング ---
+        if is_desktop_recording:
+            # A. キー入力フィルタリング: アクティブウィンドウが録画領域内にあるか
+            if keys_info:
+                fg_rect = self.window_utils.get_window_rect(fg_hwnd)
+                if fg_rect:
+                    # 中心計算
+                    cx = fg_rect['left'] + fg_rect['width'] / 2
+                    cy = fg_rect['top'] + fg_rect['height'] / 2
+                    
+                    # 録画領域
+                    r_left = rect['left']
+                    r_top = rect['top']
+                    r_right = r_left + rect['width']
+                    r_bottom = r_top + rect['height']
+                    
+                    # 中心が領域外ならキー入力を無効化
+                    if not (r_left <= cx < r_right and r_top <= cy < r_bottom):
+                        keys_info = []
+                else:
+                    # 情報取得失敗時は念のため除外
+                    keys_info = []
+
+            # B. マウス入力フィルタリング: 座標が録画領域外なら除外
+            # (Release "None" は除外しない)
+            if click_info != "None":
+                if not (0 <= rel_x < w and 0 <= rel_y < h):
+                    click_info = "None"
+
+        # --- 共通フィルタリング (Shortcut Manager) ---
+        if self.shortcut_manager:
+            # 組み合わせ文字列を生成
+            modifiers = []
+            others = []
+            for k in keys_info:
+                if k in ["Ctrl", "Shift", "Alt", "Win"]:
+                    modifiers.append(k)
+                else:
+                    others.append(k)
+            
+            click_part = ""
+            if "L" in click_info: click_part = "L-Click"
+            elif "R" in click_info: click_part = "R-Click"
+            elif "M" in click_info: click_part = "M-Click"
+            
+            allow = False
+            
+            # 何も入力がない場合は許可 (None)
+            if click_info == "None" and not keys_info:
+                allow = True
+            else:
+                # キーがある場合
+                if keys_info:
+                    key_str = "+".join(modifiers + others)
+                    if self.shortcut_manager.is_allowed(key_str):
+                        allow = True
+                
+                # クリックがある場合、修飾キー+クリックの判定
+                if not allow and click_part:
+                    if modifiers:
+                        mod_click_str = "+".join(modifiers + [click_part])
+                        if self.shortcut_manager.is_allowed(mod_click_str):
+                            allow = True
+                    else:
+                        # 修飾キーなしクリック -> 常に許可方針
+                        pass
+
+        if not keys_info:
+                # キー入力なしのクリックのみ -> 常に許可（動作履歴として重要）
+                allow = True
+        
+        if not allow:
+            # 記録しない
+            click_info = "None"
+            keys_info = []
+
+        return click_info, keys_info, rel_x, rel_y
+
     def _record_loop(
         self,
         filepath: str,
@@ -173,112 +294,10 @@ class ScreenRecorderLogic:
                                 if frame.shape[1] != w or frame.shape[0] != h:
                                     frame = cv2.resize(frame, (w, h))
 
-                                # マウス座標取得 (screen relative)
-                                # ポインター位置取得のためにWinAPIを使う (Tkinter依存を避ける)
-                                pt = ctypes.wintypes.POINT()
-                                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-                                cursor_x, cursor_y = pt.x, pt.y
-                                
-                                # 動画内相対座標の計算
-                                rel_x = cursor_x - rect['left']
-                                rel_y = cursor_y - rect['top']
-                                
+                                # 入力情報の取得 (共通化されたメソッドを使用)
                                 if record_tsv:
-                                    # WGCかつウィンドウ録画時のみ、アクティブウィンドウチェックを行う
-                                    should_record_input = True
-                                    if wgc and hwnd:
-                                        fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
-                                        if fg_hwnd != hwnd:
-                                            should_record_input = False
-
-                                    if should_record_input:
-                                        click_info, keys_info = self._get_input_state()
+                                    click_info, keys_info, rel_x, rel_y = self.get_filtered_input_state(rect, hwnd, wgc)
                                     
-                                        # フィルタリング
-                                        if self.shortcut_manager:
-                                            # 組み合わせ文字列を生成
-                                            # 基本: Keys (Modifier+Char) + Click
-                                            combo_parts = []
-                                            
-                                            # Keys (Sorted: Ctrl, Shift, Alt, Win first)
-                                            # _get_input_state returns modifiers first, so we just join
-                                            modifiers = []
-                                            others = []
-                                            for k in keys_info:
-                                                if k in ["Ctrl", "Shift", "Alt", "Win"]:
-                                                    modifiers.append(k)
-                                                else:
-                                                    others.append(k)
-                                            
-                                            # 複数キー同時押しの場合の表現は "Ctrl+Shift+A" など
-                                            # 他のキーが複数ある場合 (A, B) -> "Ctrl+A" と "Ctrl+B" 両方判定？
-                                            # ここでは単純化して、全て結合した 1つの文字列で判定する
-                                            # 例: Ctrl, Shift, A -> "Ctrl+Shift+A"
-                                            
-                                            # Click info
-                                            click_part = ""
-                                            if "L" in click_info: click_part = "L-Click"
-                                            elif "R" in click_info: click_part = "R-Click"
-                                            elif "M" in click_info: click_part = "M-Click"
-                                            
-                                            # Construct check string
-                                            # 1. Keys only
-                                            # 2. Keys + Click
-                                            
-                                            allow = False
-                                            
-                                            # 何も入力がない場合は許可 (None)
-                                            if click_info == "None" and not keys_info:
-                                                allow = True
-                                            else:
-                                                # キーがある場合
-                                                if keys_info:
-                                                    key_str = "+".join(modifiers + others)
-                                                    if self.shortcut_manager.is_allowed(key_str):
-                                                        allow = True
-                                                
-                                                # クリックがある場合、修飾キー+クリックの判定
-                                                if not allow and click_part:
-                                                    # 例: "Ctrl+L-Click"
-                                                    if modifiers:
-                                                        mod_click_str = "+".join(modifiers + [click_part])
-                                                        if self.shortcut_manager.is_allowed(mod_click_str):
-                                                            allow = True
-                                                    else:
-                                                        # 修飾キーなしクリック
-                                                        # 基本的にクリック単体はフィルタ対象外（記録する）としたいが、
-                                                        # 要件「無効にした入力キーは記録しない」
-                                                        # デフォルトリストに "L-Click" 単体は入っていない -> 記録されない？
-                                                        # -> マウス操作は基本記録したいはず。
-                                                        # -> 「入力されうるショートカットキー組み合わせ一覧」とあるので、
-                                                        #    ショートカットのみを対象とする意図か、全入力か。
-                                                        #    「マウス複合も含む」とある。
-                                                        #    通常のマウス操作（クリック）が記録されないと困る。
-                                                        #    方針: キー入力を含まない純粋なクリックは常に許可する、または
-                                                        #    ホワイトリストになくても許可する "Pass-through" ロジックにするか？
-                                                        #    -> User Request: "一覧で無効にした入力キーは記録しない"
-                                                        #    -> 裏を返すと、一覧にないものは？ -> Implementation Plan: "White List based"
-                                                        #    -> つまり一覧にないものは記録しない。
-                                                        #    -> したがって "L-Click" も一覧になければ記録しないことになる。
-                                                        #    -> これは使い勝手が悪いかもしれないが、仕様通り実装する。
-                                                        #    -> ただし、デフォルトリストにマウス操作系を入れていないなら、修正が必要かも。
-                                                        #    -> Planでは "Mouse Combinations (Example)" とある。
-                                                        #    -> 安全のため、キー入力が無い(modifiersなし & othersなし)クリック単体は
-                                                        #       常に許可する実装にしておくのが無難か。
-                                                        #       あるいは is_allowed の中で None チェック等はしているので、
-                                                        #       ここでも キー入力がある場合のみチェックを行い、
-                                                        #       キー入力がないクリックはスルー（記録）する。
-                                                        pass
-
-                                        if not keys_info:
-                                             # キー入力なしのクリックのみ -> 常に許可（動作履歴として重要）
-                                             allow = True
-                                        
-                                        if not allow:
-                                            # 記録しない (Noneにする)
-                                            click_info = "None"
-                                            keys_info = []
-
                                     self.trajectory_data.append((
                                         round(now - start_time, 3), 
                                         frame_idx, 
