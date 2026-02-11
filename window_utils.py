@@ -147,6 +147,17 @@ class WindowUtils:
         uFlags = 0x0004 | 0x0010
         return ctypes.windll.user32.SetWindowPos(hwnd, 0, real_x, real_y, real_w, real_h, uFlags) != 0
 
+    def is_window_maximized(self, hwnd: Any) -> bool:
+        """ウィンドウが最大化されているか確認する."""
+        # IsZoomed (User32) を使用
+        return ctypes.windll.user32.IsZoomed(hwnd) != 0
+
+    def set_window_maximized(self, hwnd: Any, maximize: bool) -> bool:
+        """ウィンドウの最大化/元に戻すを設定する."""
+        # SW_MAXIMIZE = 3, SW_RESTORE = 9
+        cmd = 3 if maximize else 9
+        return ctypes.windll.user32.ShowWindow(hwnd, cmd) != 0
+
     def set_window_display_affinity(self, hwnd: Any, exclude: bool = True) -> bool:
         """ウィンドウをキャプチャから除外するかどうかを設定する (Windows 10 2004+)."""
         # WDA_NONE = 0x00, WDA_MONITOR = 0x01, WDA_EXCLUDEFROMCAPTURE = 0x11

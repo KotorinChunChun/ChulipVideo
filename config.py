@@ -12,6 +12,7 @@ from utils import get_base_dir, ratio_label_from_wh
 
 # 定数
 PROJECT_NAME = "ChulipVideo"
+PROJECT_VERSION = "v0.2.3-beta"
 
 # 設定ファイル名を定数化
 CONFIG_FILENAME = f"{PROJECT_NAME}_config.json"

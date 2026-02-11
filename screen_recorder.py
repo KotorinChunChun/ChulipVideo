@@ -1,6 +1,6 @@
-"""デスクトップ録画機能モジュール.
+"""画面録画機能モジュール
 
-メインアプリケーションから呼び出される録画ツール。
+メインアプリケーションから呼び出される録画を行うためのウィンドウ。
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import overlay_utils
-from config import PROJECT_NAME, get_base_dir, load_global_config, save_global_config
+from config import PROJECT_NAME, PROJECT_VERSION, get_base_dir, load_global_config, save_global_config
 from recorder_core import ScreenRecorderLogic
 from shortcut_manager import ShortcutManager
 from shortcut_settings_dialog import ShortcutSettingsDialog
@@ -107,6 +107,107 @@ class UnityCaptureInstaller:
 if TYPE_CHECKING:
     from ChulipVideo import VideoCropperApp
 
+class IndependentPreviewWindow(tk.Toplevel):
+    """プレビュー専用の独立したフレームレスウィンドウ (OBS認識対応版)"""
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        # overrideredirect(True) を使うとOBSで認識されないため False。
+        # 代わりに Windows API でスタイルを剥ぎ取る。
+        self.overrideredirect(False)
+        self.title(f"{PROJECT_NAME} - 録画プレビューツール")
+        
+        self.attributes("-topmost", True)
+        self.canvas = tk.Canvas(self, bg="black", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.image_id = None
+        
+        # ドラッグ用
+        self._drag_start_x = 0
+        self._drag_start_y = 0
+        self.canvas.bind("<Button-1>", self._on_drag_start)
+        self.canvas.bind("<B1-Motion>", self._on_drag_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
+
+        # ウィンドウを強制的に作成してからスタイルを剥ぎ取る
+        self.update()
+        self._remove_title_bar()
+        
+    def _remove_title_bar(self):
+        """Windows APIを使用してタイトルバーや枠線を消す"""
+        hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+        if not hwnd: hwnd = self.winfo_id()
+        
+        # 基本スタイル (GWL_STYLE = -16)
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, -16)
+        
+        # WS_POPUP (0x80000000) を追加し、装飾スタイルを削除
+        style &= ~0x00C00000 # WS_CAPTION
+        style &= ~0x00040000 # WS_THICKFRAME
+        style &= ~0x00020000 # WS_MINIMIZEBOX
+        style &= ~0x00010000 # WS_MAXIMIZEBOX
+        style &= ~0x00080000 # WS_SYSMENU
+        style |= 0x80000000  # WS_POPUP
+        
+        ctypes.windll.user32.SetWindowLongW(hwnd, -16, style)
+        
+        # 拡張スタイル (GWL_EXSTYLE = -20) のクリーンアップ (余白・影対策)
+        ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+        # WS_EX_DLGMODALFRAME (0x00000001), WS_EX_WINDOWEDGE (0x00000100), 
+        # WS_EX_CLIENTEDGE (0x00000200), WS_EX_STATICEDGE (0x00020000) を削除
+        ex_style &= ~0x00000001
+        ex_style &= ~0x00000100
+        ex_style &= ~0x00000200
+        ex_style &= ~0x00020000
+        ctypes.windll.user32.SetWindowLongW(hwnd, -20, ex_style)
+        
+        # 変更を反映 (SWP_FRAMECHANGED = 0x0020, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001)
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0004 | 0x0010 | 0x0002 | 0x0001 | 0x0020)
+        
+    def _on_drag_start(self, event):
+        self._drag_start_x = event.x
+        self._drag_start_y = event.y
+        
+    def _on_drag_motion(self, event):
+        x = self.winfo_x() + (event.x - self._drag_start_x)
+        y = self.winfo_y() + (event.y - self._drag_start_y)
+        
+        # geometry() を使うとOSの再描画と競合してチラつきや一瞬の黒枠が発生するため、
+        # SetWindowPos API で位置のみを直接変更する。
+        # SWP_NOSIZE(0x0001) | SWP_NOZORDER(0x0004) | SWP_NOACTIVATE(0x0010)
+        hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+        if not hwnd: hwnd = self.winfo_id()
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010)
+
+    def _on_drag_end(self, event):
+        # 移動終了時に座標をアプリ側の変数に保存
+        self.app.last_independent_preview_pos = f"+{self.winfo_x()}+{self.winfo_y()}"
+
+    def update_image(self, img: Image.Image):
+        """画像を1:1で表示。サイズが異なればウィンドウサイズを調整"""
+        w, h = img.size
+        curr_x = self.winfo_x()
+        curr_y = self.winfo_y()
+        
+        if self.winfo_width() != w or self.winfo_height() != h:
+            # 座標を維持したままサイズを更新
+            # TkinterのgeometryではなくSetWindowPosで直接叩く（枠誤認回避）
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            if not hwnd: hwnd = self.winfo_id()
+            # SWP_NOZORDER(4) | SWP_NOACTIVATE(10)
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, curr_x, curr_y, w, h, 0x0004 | 0x0010)
+            # Tkinter側にも把握させる
+            self.update_idletasks()
+            
+        self.tk_img = ImageTk.PhotoImage(img)
+        if self.image_id is None:
+            self.image_id = self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_img)
+        else:
+            self.canvas.itemconfig(self.image_id, image=self.tk_img)
+        
+        # 確実に表示されるように前面へ
+        self.lift()
+        self.attributes("-topmost", True) # 念のため再度セット
 
 class ScreenRecorderApp:
     """デスクトップ録画ツール.
@@ -146,7 +247,7 @@ class ScreenRecorderApp:
             self.root = tk.Toplevel(root)
             self.standalone = False
             
-        self.root.title(f"{PROJECT_NAME} 録画ツール")
+        self.root.title(f"{PROJECT_NAME} - 録画ツール")
         self.parent_app = parent_app
         
         # アイコン設定
@@ -232,6 +333,10 @@ class ScreenRecorderApp:
         self.preview_fit_var = tk.BooleanVar(value=True)
         self.show_preview_overlay_var = tk.BooleanVar(value=True)
         self.show_vcam_var = tk.BooleanVar(value=False)
+        self.sync_geo_var = tk.BooleanVar(value=True) # 座標同期フラグ
+        self.max_geo_var = tk.BooleanVar(value=False) # 最大化フラグ
+        self.preview_independent_var = tk.BooleanVar(value=False) # 独立プレビューフラグ
+        self.last_independent_preview_pos = "+0+0" # セッション内の表示座標
         
         # プレイヤー/プレビューのパン・ズーム用
         self.player_zoom = 1.0
@@ -255,6 +360,7 @@ class ScreenRecorderApp:
         self.vcam_instance = None
         self.widgets_to_lock: List[tk.Widget] = []
         self.region_window: Optional[tk.Toplevel] = None
+        self.independent_preview_window: Optional[IndependentPreviewWindow] = None
         self.monitors: List[Dict[str, Any]] = []
         self.windows: List[Tuple[Any, str, str, int]] = []
         self.file_items: List[str] = []
@@ -286,12 +392,14 @@ class ScreenRecorderApp:
         self.quality_var.set(self.global_config.get("recorder_quality", "最高"))
         self.show_region_var.set(self.global_config.get("recorder_show_region", True))
         self.show_preview_overlay_var.set(self.global_config.get("recorder_show_preview_overlay", True))
+        self.preview_independent_var.set(self.global_config.get("recorder_preview_independent", False))
 
         # 設定変更時の自動保存トレース
         self.fps_var.trace_add("write", lambda *args: self.save_window_geometry())
         self.quality_var.trace_add("write", lambda *args: self.save_window_geometry())
         self.show_region_var.trace_add("write", lambda *args: self.save_window_geometry())
         self.show_preview_overlay_var.trace_add("write", lambda *args: self.save_window_geometry())
+        self.preview_independent_var.trace_add("write", lambda *args: self.save_window_geometry())
 
     def on_tab_changed(self, event):
         """タブ切り替え時の処理"""
@@ -339,6 +447,7 @@ class ScreenRecorderApp:
         config["recorder_source"] = self.source_var.get()
         config["recorder_show_region"] = self.show_region_var.get()
         config["recorder_show_preview_overlay"] = self.show_preview_overlay_var.get()
+        config["recorder_preview_independent"] = self.preview_independent_var.get()
         config["recorder_fps"] = self.fps_var.get()
         config["recorder_quality"] = self.quality_var.get()
         
@@ -510,30 +619,48 @@ class ScreenRecorderApp:
         self.geo_w = tk.IntVar()
         self.geo_h = tk.IntVar()
         
+        # リアルタイム反映用のトレース設定
+        for var in [self.geo_x, self.geo_y, self.geo_w, self.geo_h]:
+            var.trace_add("write", self._on_geo_var_changed)
+        
+        # 最大化・同期チェックボックス
+        self.check_max_geo = tk.Checkbutton(geo_frame, text="最大化", variable=self.max_geo_var, 
+                                            command=self._on_max_changed, indicatoron=False, 
+                                            selectcolor="", relief=tk.RAISED, overrelief=tk.RIDGE)
+        self.check_max_geo.pack(side=tk.LEFT, padx=(0, 2), ipadx=5)
+        self.widgets_to_lock.append(self.check_max_geo)
+
+        self.check_sync_geo = tk.Checkbutton(geo_frame, text="同期", variable=self.sync_geo_var, command=self._on_geo_ctrl_changed)
+        self.check_sync_geo.pack(side=tk.LEFT, padx=(0, 5))
+        self.widgets_to_lock.append(self.check_sync_geo)
+
         tk.Label(geo_frame, text="座標 X:").pack(side=tk.LEFT)
-        self.entry_x = tk.Entry(geo_frame, textvariable=self.geo_x, width=5)
-        self.entry_x.pack(side=tk.LEFT, padx=2)
+        self.spin_x = tk.Spinbox(geo_frame, from_=-10000, to=10000, textvariable=self.geo_x, width=5)
+        self.spin_x.pack(side=tk.LEFT, padx=2)
         
         tk.Label(geo_frame, text="Y:").pack(side=tk.LEFT)
-        self.entry_y = tk.Entry(geo_frame, textvariable=self.geo_y, width=5)
-        self.entry_y.pack(side=tk.LEFT, padx=2)
+        self.spin_y = tk.Spinbox(geo_frame, from_=-10000, to=10000, textvariable=self.geo_y, width=5)
+        self.spin_y.pack(side=tk.LEFT, padx=2)
         
         tk.Label(geo_frame, text="W:").pack(side=tk.LEFT)
-        self.entry_w = tk.Entry(geo_frame, textvariable=self.geo_w, width=5)
-        self.entry_w.pack(side=tk.LEFT, padx=2)
+        self.spin_w = tk.Spinbox(geo_frame, from_=0, to=10000, textvariable=self.geo_w, width=5)
+        self.spin_w.pack(side=tk.LEFT, padx=2)
         
         tk.Label(geo_frame, text="H:").pack(side=tk.LEFT)
-        self.entry_h = tk.Entry(geo_frame, textvariable=self.geo_h, width=5)
-        self.entry_h.pack(side=tk.LEFT, padx=2)
+        self.spin_h = tk.Spinbox(geo_frame, from_=0, to=10000, textvariable=self.geo_h, width=5)
+        self.spin_h.pack(side=tk.LEFT, padx=2)
         
         self.btn_apply_geo = tk.Button(geo_frame, text="適用", command=self.apply_window_geometry, width=4, bg=self.COLOR_BTN_UPDATE)
         self.btn_apply_geo.pack(side=tk.LEFT, padx=5)
         
-        for entry in [self.entry_x, self.entry_y, self.entry_w, self.entry_h]:
-            entry.bind("<Return>", lambda e: self.apply_window_geometry())
-            entry.bind("<Tab>", lambda e: self.apply_window_geometry())
-            self.widgets_to_lock.append(entry)
+        for spin in [self.spin_x, self.spin_y, self.spin_w, self.spin_h]:
+            spin.bind("<Return>", lambda e: self.apply_window_geometry())
+            spin.bind("<MouseWheel>", self._on_geo_spin_wheel)
+            self.widgets_to_lock.append(spin)
         self.widgets_to_lock.append(self.btn_apply_geo)
+        
+        # 初期状態反映
+        self._on_sync_changed()
 
         
         # 4. プレビュー
@@ -590,6 +717,14 @@ class ScreenRecorderApp:
         self.check_preview_overlay = tk.Checkbutton(options_frame, text="プレビューに演出を表示", variable=self.show_preview_overlay_var)
         self.check_preview_overlay.pack(side=tk.LEFT, padx=5)
         self.widgets_to_lock.append(self.check_preview_overlay)
+
+        self.check_preview_independent = tk.Checkbutton(options_frame, text="プレビューウィンドウを独立させる", 
+                                                        variable=self.preview_independent_var,
+                                                        indicatoron=False, selectcolor="", 
+                                                        relief=tk.RAISED, overrelief=tk.RIDGE)
+        self.check_preview_independent.pack(side=tk.LEFT, padx=5, ipadx=5)
+        self.widgets_to_lock.append(self.check_preview_independent)
+        
         # self.btn_shortcut_settings = tk.Button(options_frame, text="キー設定", command=self.open_shortcut_settings, height=1)
         # self.btn_shortcut_settings.pack(side=tk.LEFT, padx=10)
         # self.widgets_to_lock.append(self.btn_shortcut_settings)
@@ -745,7 +880,7 @@ class ScreenRecorderApp:
                 self.target_var.set("")
             
             self.entry_filter.config(state=tk.DISABLED)
-            for w in [self.entry_x, self.entry_y, self.entry_w, self.entry_h, self.btn_apply_geo]:
+            for w in [self.spin_x, self.spin_y, self.spin_w, self.spin_h, self.btn_apply_geo, self.check_sync_geo]:
                 w.config(state=tk.DISABLED)
                 
         elif mode == 'window':
@@ -760,12 +895,96 @@ class ScreenRecorderApp:
                 self.target_var.set("")
             
             self.entry_filter.config(state=tk.NORMAL)
-            for w in [self.entry_x, self.entry_y, self.entry_w, self.entry_h, self.btn_apply_geo]:
+            for w in [self.spin_x, self.spin_y, self.spin_w, self.spin_h, self.check_sync_geo]:
                 w.config(state=tk.NORMAL)
+            self._on_sync_changed()
 
         self.on_target_changed(None)
 
+    def _on_max_changed(self):
+        """最大化チェックボタンがクリックされた時の処理"""
+        if self.source_var.get() == 'window':
+            idx = self.combo_target.current()
+            if idx >= 0 and idx < len(self.windows):
+                hwnd = self.windows[idx][0]
+                is_max = self.max_geo_var.get()
+                if is_max:
+                    self.window_utils.set_window_maximized(hwnd, True)
+                else:
+                    # OFFにしたとき、現在の(最大化時の)座標を取得して保持
+                    rect = self.window_utils.get_window_rect(hwnd)
+                    # 元に戻す
+                    self.window_utils.set_window_maximized(hwnd, False)
+                    # 保持していた座標を適用することでサイズを維持
+                    if rect:
+                        self.window_utils.set_window_position(hwnd, rect['left'], rect['top'], rect['width'], rect['height'])
+        
+        # 見た目の更新 (トグルボタンらしく凹凸を変える)
+        if self.max_geo_var.get():
+            self.check_max_geo.config(relief=tk.SUNKEN)
+        else:
+            self.check_max_geo.config(relief=tk.RAISED)
+            
+        self._on_geo_ctrl_changed()
+
+    def _on_geo_ctrl_changed(self):
+        """最大化または同期チェックボックスの状態変更時のUI更新処理"""
+        is_maximized = self.max_geo_var.get()
+        is_sync = self.sync_geo_var.get()
+        
+        # 最大化ONの時はすべて無効化
+        if is_maximized:
+            self.check_sync_geo.config(state=tk.DISABLED)
+            for w in [self.spin_x, self.spin_y, self.spin_w, self.spin_h, self.btn_apply_geo]:
+                w.config(state=tk.DISABLED)
+            # 最大化ONになった瞬間に一度反映させる
+            self.on_target_changed(None)
+        else:
+            self.check_sync_geo.config(state=tk.NORMAL)
+            # 同期ONの時は数値を無効化せず、適用ボタンのみ無効化（ホイールでの即時反映は維持）
+            # ただしユーザーの要望「最大化がONのときは...XYWHもすべて無効化して変更できなくする」
+            # 同期ONのときは無効化するかどうか？ 前回の実装ではSpinboxは有効でした。
+            # 要望に合わせて、同期ONのときもSpinboxは有効なまま（ホイール操作用）にします。
+            for w in [self.spin_x, self.spin_y, self.spin_w, self.spin_h]:
+                w.config(state=tk.NORMAL)
+            
+            if is_sync:
+                self.btn_apply_geo.config(state=tk.DISABLED)
+                self.on_target_changed(None)
+            else:
+                self.btn_apply_geo.config(state=tk.NORMAL)
+
+    def _on_sync_changed(self):
+        """(互換用・削除予定) 同期チェックボックスの状態変更時の処理"""
+        self._on_geo_ctrl_changed()
+
+    def _on_geo_spin_wheel(self, event):
+        """Spinbox上でのマウスホイール操作"""
+        delta = 1 if event.delta > 0 else -1
+        # Linux/macOS対応 (念のため)
+        if event.num == 4: delta = 1
+        if event.num == 5: delta = -1
+        
+        widget: tk.Spinbox = event.widget
+        try:
+            curr = int(widget.get())
+            widget.delete(0, tk.END)
+            widget.insert(0, str(curr + delta))
+            # self.geo_x 等の変数が更新されるため、traceにより apply_window_geometry が呼ばれる
+        except:
+            pass
+        return "break"
+
+    def _on_geo_var_changed(self, *args):
+        """座標変数が変更された時の処理"""
+        # 同期ONの時だけ即座に反映
+        if self.sync_geo_var.get() and not self.max_geo_var.get():
+            self.apply_window_geometry()
+
     def on_target_changed(self, event):
+        if not self.sync_geo_var.get():
+            return
+            
         rect = self._get_target_rect()
         if rect:
             self.geo_x.set(rect['left'])
@@ -776,7 +995,7 @@ class ScreenRecorderApp:
 
     def apply_window_geometry(self):
         """入力ボックスの値でウィンドウを移動・リサイズ"""
-        if self.source_var.get() == 'window':
+        if self.source_var.get() == 'window' and not self.max_geo_var.get():
             idx = self.combo_target.current()
             if idx >= 0 and idx < len(self.windows):
                 hwnd = self.windows[idx][0]
@@ -786,8 +1005,9 @@ class ScreenRecorderApp:
                     w = self.geo_w.get()
                     h = self.geo_h.get()
                     self.window_utils.set_window_position(hwnd, x, y, w, h)
-                    # 反映を確認するために少し待ってから更新
-                    self.root.after(100, lambda: self._force_update_target_info())
+                except tk.TclError:
+                    # 入力欄が空などの場合は無視
+                    pass
                 except Exception as e:
                     print(f"Geometry apply error: {e}")
 
@@ -926,46 +1146,84 @@ class ScreenRecorderApp:
                                         self.theme
                                     )
 
-                        # --- Canvas への表示処理 (オーバーレイ描画後にリサイズ) ---
-                        cw = self.preview_canvas.winfo_width()
-                        ch = self.preview_canvas.winfo_height()
-                        if cw > 1 and ch > 1:
-                            img_w, img_h = img.size
-                            if self.preview_fit_var.get():
-                                # 比例リサイズ
-                                ratio = min(cw / img_w, ch / img_h)
-                                new_w = int(img_w * ratio)
-                                new_h = int(img_h * ratio)
-                                if new_w > 0 and new_h > 0:
-                                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                                
-                                # 中央配置
-                                off_x = (cw - img.width) // 2
-                                off_y = (ch - img.height) // 2
-                            else:
-                                # パン・ズーム
-                                scale_view = self.preview_zoom
-                                new_w = int(img_w * scale_view)
-                                new_h = int(img_h * scale_view)
-                                if new_w > 0 and new_h > 0:
-                                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                                
-                                off_x = cw // 2 + self.preview_pan_x - img.width // 2
-                                off_y = ch // 2 + self.preview_pan_y - img.height // 2
+                        # --- 表示処理 (独立ウィンドウ or 本体Canvas) ---
+                        try:
+                            if self.preview_independent_var.get():
+                                # ボタンの凹凸を制御
+                                self.check_preview_independent.config(relief=tk.SUNKEN)
 
-                            tk_img = ImageTk.PhotoImage(img)
-                            
-                            if self.preview_image_id:
-                                self.preview_canvas.itemconfig(self.preview_image_id, image=tk_img)
-                                # アンカーをNWに変更して座標指定
-                                self.preview_canvas.coords(self.preview_image_id, off_x, off_y)
-                                self.preview_canvas.itemconfig(self.preview_image_id, anchor=tk.NW)
+                                # 1. 独立ウィンドウの管理
+                                if not self.independent_preview_window or not self.independent_preview_window.winfo_exists():
+                                    self.independent_preview_window = IndependentPreviewWindow(self.root, self)
+                                    # 前回の表示座標を使用
+                                    self.independent_preview_window.geometry(self.last_independent_preview_pos)
+                                
+                                # 2. 独立ウィンドウを更新 (1:1描画)
+                                self.independent_preview_window.update_image(img)
+                                
+                                # 3. 本体Canvasをクリア & 通知テキスト表示
+                                self.preview_canvas.delete("all")
+                                self.preview_canvas.create_text(
+                                    self.preview_canvas.winfo_width() // 2,
+                                    self.preview_canvas.winfo_height() // 2,
+                                    text="別のウィンドウでプレビュー中です",
+                                    fill="white", font=("Arial", 12)
+                                )
+                                self.preview_image_id = None
                             else:
-                                self.preview_image_id = self.preview_canvas.create_image(off_x, off_y, image=tk_img, anchor=tk.NW)
+                                # ボタンの凹凸を制御
+                                self.check_preview_independent.config(relief=tk.RAISED)
+
+                                # 独立ウィンドウが開いていれば閉じる
+                                if self.independent_preview_window and self.independent_preview_window.winfo_exists():
+                                    self.independent_preview_window.destroy()
+                                    self.independent_preview_window = None
+
+                                # --- Canvas への表示処理 (従来通り) ---
+                                cw = self.preview_canvas.winfo_width()
+                                ch = self.preview_canvas.winfo_height()
+                                if cw > 1 and ch > 1:
+                                    img_w, img_h = img.size
+                                    if self.preview_fit_var.get():
+                                        # 比例リサイズ
+                                        ratio = min(cw / img_w, ch / img_h)
+                                        new_w = int(img_w * ratio)
+                                        new_h = int(img_h * ratio)
+                                        if new_w > 0 and new_h > 0:
+                                            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                                        
+                                        # 中央配置
+                                        off_x = (cw - img.width) // 2
+                                        off_y = (ch - img.height) // 2
+                                    else:
+                                        # パン・ズーム
+                                        scale_view = self.preview_zoom
+                                        new_w = int(img_w * scale_view)
+                                        new_h = int(img_h * scale_view)
+                                        if new_w > 0 and new_h > 0:
+                                            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                                        
+                                        # 中央配置
+                                        off_x = cw // 2 + self.preview_pan_x - img.width // 2
+                                        off_y = ch // 2 + self.preview_pan_y - img.height // 2
+
+                                    tk_img = ImageTk.PhotoImage(img)
+                                    
+                                    if self.preview_image_id:
+                                        self.preview_canvas.itemconfig(self.preview_image_id, image=tk_img)
+                                        # アンカーをNWに変更して座標指定
+                                        self.preview_canvas.coords(self.preview_image_id, off_x, off_y)
+                                        self.preview_canvas.itemconfig(self.preview_image_id, anchor=tk.NW)
+                                    else:
+                                        self.preview_image_id = self.preview_canvas.create_image(off_x, off_y, image=tk_img, anchor=tk.NW)
+                                    
+                                    self.preview_canvas.image = tk_img
+                        except Exception as disp_e:
+                            # 表示処理のエラーはログに出して握りつぶし、配信を止めない
+                            print(f"Preview Display Error: {disp_e}")
                             
-                            self.preview_canvas.image = tk_img
-                            
-                            # --- 仮想カメラへの送信 ---
+                        # --- 仮想カメラへの送信 (分岐の外に出して常時実行) ---
+                        try:
                             if self.show_vcam_var.get() and pyvirtualcam:
                                 try:
                                     # 元画像(演出込み)をRGBに変換して送信
@@ -1004,6 +1262,8 @@ class ScreenRecorderApp:
                                     self.vcam_instance.close()
                                 except: pass
                                 self.vcam_instance = None
+                        except Exception as vcam_outer_e:
+                            print(f"VCam Logic Error: {vcam_outer_e}")
                 except Exception as e:
                     pass
 
@@ -1243,22 +1503,42 @@ class ScreenRecorderApp:
             # ------------------------------
             
             # 座標・サイズのUI自動更新
-            # ユーザーが入力中でない場合のみ更新する
             try:
-                focused_widget = self.root.focus_get()
-            except KeyError:
-                # Comboboxのドロップダウンなどがフォーカスを持っている場合 KeyError: 'popdown' が出ることがある
-                focused_widget = None
-            except Exception:
-                focused_widget = None
+                # 最大化状態の連動 (Syncに関わらず反映)
+                if self.source_var.get() == 'window' and rect:
+                    idx = self.combo_target.current()
+                    if idx >= 0 and idx < len(self.windows):
+                        hwnd = self.windows[idx][0]
+                        is_maximized = self.window_utils.is_window_maximized(hwnd)
+                        if self.max_geo_var.get() != is_maximized:
+                            self.max_geo_var.set(is_maximized)
+                            # 見た目の更新
+                            if is_maximized:
+                                self.check_max_geo.config(relief=tk.SUNKEN)
+                            else:
+                                self.check_max_geo.config(relief=tk.RAISED)
+                            self._on_geo_ctrl_changed() # 状態が変わったらUI制御を更新
 
-            input_widgets = [self.entry_x, self.entry_y, self.entry_w, self.entry_h]
-            if focused_widget not in input_widgets:
-                if rect:
-                    if self.geo_x.get() != rect['left']: self.geo_x.set(rect['left'])
-                    if self.geo_y.get() != rect['top']: self.geo_y.set(rect['top'])
-                    if self.geo_w.get() != rect['width']: self.geo_w.set(rect['width'])
-                    if self.geo_h.get() != rect['height']: self.geo_h.set(rect['height'])
+                # ユーザーが入力中でなく、かつ（同期ON または 最大化ON）の場合のみ数値を更新する
+                is_max = self.max_geo_var.get()
+                is_sync = self.sync_geo_var.get()
+                
+                try:
+                    focused_widget = self.root.focus_get()
+                except (KeyError, Exception):
+                    focused_widget = None
+
+                if is_max or is_sync:
+                    input_widgets = [self.spin_x, self.spin_y, self.spin_w, self.spin_h]
+                    if focused_widget not in input_widgets:
+                        if rect:
+                            if self.geo_x.get() != rect['left']: self.geo_x.set(rect['left'])
+                            if self.geo_y.get() != rect['top']: self.geo_y.set(rect['top'])
+                            if self.geo_w.get() != rect['width']: self.geo_w.set(rect['width'])
+                            if self.geo_h.get() != rect['height']: self.geo_h.set(rect['height'])
+            except Exception as e:
+                # ウィンドウが閉じられた直後などのエラー無視
+                pass
 
         # 録画中または録画タブならループを継続
         if is_recording or is_in_record_tab:

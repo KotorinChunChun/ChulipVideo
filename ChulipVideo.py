@@ -1,3 +1,7 @@
+"""アプリケーションメインモジュール
+
+動画編集を行うためのウィンドウ。
+"""
 from __future__ import annotations
 
 import json
@@ -32,6 +36,7 @@ from utils import (
 from config import (
     CONFIG_FILENAME,
     PROJECT_NAME,
+    PROJECT_VERSION,
     load_global_config,
     save_global_config,
     load_video_settings,
@@ -75,7 +80,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
     def __init__(self, root):
         self.root = root
-        self.root.title(f"{PROJECT_NAME} - Created By ことりちゅん - v0.2.3")
+        self.root.title(f"{PROJECT_NAME} {PROJECT_VERSION} - 編集ツール")
         
         # アイコン設定
         try:
