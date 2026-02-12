@@ -40,6 +40,34 @@ class WindowUtils:
         # sct.monitors[0] は全画面結合なので除外する
         return self.sct.monitors[1:]
 
+    def get_workarea_info(self) -> List[Dict[str, Any]]:
+        """モニターの作業領域（タスクバーを除いた領域）を取得する."""
+        monitors = []
+        
+        def enum_monitors_proc(hMonitor, hdcMonitor, lprcMonitor, dwData):
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_uint32),
+                    ("rcMonitor", ctypes.wintypes.RECT),
+                    ("rcWork", ctypes.wintypes.RECT),
+                    ("dwFlags", ctypes.c_uint32),
+                ]
+            
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if ctypes.windll.user32.GetMonitorInfoW(hMonitor, ctypes.byref(mi)):
+                monitors.append({
+                    "left": mi.rcWork.left,
+                    "top": mi.rcWork.top,
+                    "width": mi.rcWork.right - mi.rcWork.left,
+                    "height": mi.rcWork.bottom - mi.rcWork.top
+                })
+            return True
+
+        MONITORENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(enum_monitors_proc), 0)
+        return monitors
+
     def enum_windows(self, filter_text: str = "") -> List[Tuple[Any, str]]:
         """可視ウィンドウの一覧を取得する.
         
@@ -151,6 +179,13 @@ class WindowUtils:
         """ウィンドウが最大化されているか確認する."""
         # IsZoomed (User32) を使用
         return ctypes.windll.user32.IsZoomed(hwnd) != 0
+
+    def can_maximize(self, hwnd: Any) -> bool:
+        """ウィンドウが最大化可能か（最大化ボタンが有効か）を確認する."""
+        WS_MAXIMIZEBOX = 0x00010000
+        GWL_STYLE = -16
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+        return (style & WS_MAXIMIZEBOX) != 0
 
     def set_window_maximized(self, hwnd: Any, maximize: bool) -> bool:
         """ウィンドウの最大化/元に戻すを設定する."""
