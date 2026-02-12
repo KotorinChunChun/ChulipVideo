@@ -37,6 +37,7 @@ from window_utils import WindowUtils
 from multi_video_player import MultiVideoManager
 
 WINDOW_NAME = "CapchunScreen"
+WINDOW_TITLE = f"{WINDOW_NAME} - 画面録画ツール"
 
 # 仮想カメラライブラリのインポート試行
 try:
@@ -221,6 +222,9 @@ class CapchunScreenApp:
     (VideoCropperApp) から呼び出されることもできる。
     """
     
+    # 非standaloneモード用: 既存ウィンドウの追跡
+    _instance_window: Optional[tk.Toplevel] = None
+    
     # --- 定数 ---
     # 色定数
     COLOR_CANVAS_BG = "#444444"
@@ -252,7 +256,7 @@ class CapchunScreenApp:
             self.root = tk.Toplevel(root)
             self.standalone = False
             
-        self.root.title(f"{WINDOW_NAME} - 画面録画ツール")
+        self.root.title(WINDOW_TITLE)
         self.parent_app = parent_app
         
         # アイコン設定
@@ -294,8 +298,8 @@ class CapchunScreenApp:
 
     def _init_variables(self):
         """メンバ変数の初期化"""
-        self.window_utils = WindowUtils()
-        self.recorder_logic = CapchunScreenLogic(self.window_utils)
+        # 注意: window_utils と recorder_logic は __init__ で作成済み。
+        # ここで再生成するとMutexハンドルが失われるため、再生成しない。
 
         # ショートカット管理
         self.shortcut_manager = ShortcutManager(os.path.join(get_base_dir(), "shortcuts.tsv"))
@@ -426,9 +430,25 @@ class CapchunScreenApp:
 
     def _check_single_instance(self) -> bool:
         """二重起動チェック。既に起動している場合は前面に出して終了。"""
-        if not self.standalone:
+        if self.standalone:
+            # スタンドアロンモード: OS Mutex を使用
+            return self.window_utils.check_single_instance(
+                f"{WINDOW_NAME}_Mutex", WINDOW_TITLE
+            )
+        else:
+            # 親アプリから起動: クラス変数で既存ウィンドウを追跡
+            if CapchunScreenApp._instance_window is not None:
+                try:
+                    if CapchunScreenApp._instance_window.winfo_exists():
+                        # 既存ウィンドウを前面に出す
+                        CapchunScreenApp._instance_window.lift()
+                        CapchunScreenApp._instance_window.focus_force()
+                        return False
+                except Exception:
+                    pass
+            # 現在のウィンドウを登録
+            CapchunScreenApp._instance_window = self.root
             return True
-        return self.window_utils.check_single_instance(f"{WINDOW_NAME}_Mutex", "画面録画ツール")
 
     def load_window_geometry(self):
         """設定からウィンドウの状態を復元."""
@@ -499,6 +519,10 @@ class CapchunScreenApp:
         if self.cap:
             self.cap.release()
             
+        # クラス変数のクリア（非standaloneモードの二重起動チェック用）
+        if CapchunScreenApp._instance_window is self.root:
+            CapchunScreenApp._instance_window = None
+        
         self.root.destroy()
         if getattr(self, 'standalone', False):
             self.root.quit()
