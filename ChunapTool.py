@@ -1,588 +1,432 @@
-"""ウィンドウ位置調整ツール
+"""ウィンドウ位置調整ツール.
 
-ウィンドウ位置調整を行うためのウィンドウ。
+対象ウィンドウの位置・サイズを調整するためのツールウィンドウ。
+WGC または PrintWindow によるリアルタイムプレビュー、
+座標の同期・画面外制限・最大化制御・Undo 機能を備える。
 """
+import ctypes
 import tkinter as tk
 import tkinter.ttk as ttk
-from typing import Optional, List, Dict, Any, Tuple
-import ctypes
-import os
-import sys
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 from PIL import Image, ImageTk
 
-from window_utils import WindowUtils
-from wgc_capture import WGCCapture, WGC_AVAILABLE
-from config import PROJECT_NAME, load_global_config, save_global_config
 from utils import resource_path
+from wgc_capture import WGC_AVAILABLE, WGCCapture
+from window_utils import WindowUtils
+
+# ─── 型エイリアス ─────────────────────────────────────────────
+# (hwnd, x, y, w, h, is_maximized)
+GeoState = Tuple[Any, int, int, int, int, bool]
+
+# ─── 定数 ─────────────────────────────────────────────────────
+INITIAL_WIDTH = 640
+INITIAL_HEIGHT = 240
+MIN_WIDTH = 640
+MIN_HEIGHT = 200
+MIN_WINDOW_SIZE = 32          # ウィンドウ最小サイズ (px)
+MAX_HISTORY = 100             # Undo 履歴の最大保持数
+UI_POLL_INTERVAL_MS = 200     # UI 更新ループ間隔 (ms)
+HISTORY_POLL_INTERVAL_MS = 500  # 履歴ポーリング間隔 (ms)
+PREVIEW_WGC_INTERVAL_MS = 33  # WGC プレビュー間隔 (ms)
+PREVIEW_FALLBACK_INTERVAL_MS = 200  # フォールバックプレビュー間隔 (ms)
+
+# Win32 定数
+SW_NORMAL = 1
+SW_MAXIMIZE = 3
+VK_LBUTTON = 0x01
+
 
 class ChunapTool(tk.Tk):
-    COLOR_BTN_UPDATE = "#e1f5fe"
+    """ウィンドウ位置調整ツールのメインウィンドウ."""
 
-    def __init__(self):
+    COLOR_BTN = "#e1f5fe"  # 水色ボタンの背景色
+
+    # ──────────────────────────────────────────────────────────
+    # 初期化
+    # ──────────────────────────────────────────────────────────
+    def __init__(self) -> None:
         super().__init__()
         self.title("ChunapTool - ウィンドウ位置調整ツール")
-        
+
+        # アイコン設定
         try:
-            icon_path = resource_path("ChulipVideo.png")
-            img = tk.PhotoImage(file=icon_path)
-            self.iconphoto(False, img)
+            icon = tk.PhotoImage(file=resource_path("ChulipVideo.png"))
+            self.iconphoto(False, icon)
         except Exception as e:
             print(f"Icon load error: {e}")
 
-        # ウィンドウを画面中央に配置
+        # ウィンドウ配置（画面中央）
         self.update_idletasks()
-        w = 640
-        h = 240
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        
-        self.minsize(640, 200)
+        sx = (self.winfo_screenwidth() - INITIAL_WIDTH) // 2
+        sy = (self.winfo_screenheight() - INITIAL_HEIGHT) // 2
+        self.geometry(f"{INITIAL_WIDTH}x{INITIAL_HEIGHT}+{sx}+{sy}")
+        self.minsize(MIN_WIDTH, MIN_HEIGHT)
         self.resizable(True, True)
         self.attributes("-topmost", True)
         self.attributes("-toolwindow", 1)
-        
+
+        # 外部ユーティリティ
         self.window_utils = WindowUtils()
-        self.history: List[Tuple[Any, int, int, int, int, bool]] = [] # (hwnd, x, y, w, h, is_max)
-        self.last_state: Optional[Tuple[Any, int, int, int, int, bool]] = None
-        self._reading_rect = False
-        
-        # --- Variables ---
-        self.source_var = tk.StringVar(value="window")
+
+        # Undo 履歴
+        self.history: List[GeoState] = []
+        self.last_state: Optional[GeoState] = None
+        self._reading_rect = False  # UI 値セット中の再帰防止フラグ
+
+        # ── Tkinter 変数 ──
         self.target_var = tk.StringVar()
         self.filter_var = tk.StringVar()
-        
         self.geo_x = tk.IntVar()
         self.geo_y = tk.IntVar()
         self.geo_w = tk.IntVar()
         self.geo_h = tk.IntVar()
-        
         self.max_geo_var = tk.BooleanVar(value=False)
         self.sync_geo_var = tk.BooleanVar(value=True)
         self.allow_out_of_bounds = tk.BooleanVar(value=False)
-        
+
+        # ── 内部状態 ──
         self.windows: List[Tuple[Any, str, str, int]] = []
-        self.monitors: List[Dict[str, Any]] = []
-        
         self.wgc_capture: Optional[WGCCapture] = None
-        self.preview_image_id = None
-        
-        # --- UI Build ---
+        self.preview_image_id: Optional[int] = None
+
+        # ── 構築 ──
         self._build_ui()
-        
-        # --- Initial Load ---
-        self._load_config()
         self.update_source_list()
-        
-        # --- Start Loop ---
-        self.after(500, self._ui_update_loop)
-        self.after(500, self._history_poll_loop)
-        self.after(50, self._start_preview)
-        
-        # --- Bindings ---
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def _build_ui(self):
-        main_frame = tk.Frame(self)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # 1. Source (Window only now)
-        source_frame = tk.LabelFrame(main_frame, text="対象選択")
-        source_frame.pack(fill=tk.X, pady=5)
-        
-        # Filter
-        filter_frame = tk.Frame(source_frame)
-        filter_frame.pack(fill=tk.X, padx=5, pady=2)
-        tk.Label(filter_frame, text="検索:").pack(side=tk.LEFT)
-        self.filter_var.trace_add("write", lambda *args: self.update_source_list())
-        tk.Entry(filter_frame, textvariable=self.filter_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        
-        # Target Combo
-        target_frame = tk.Frame(source_frame)
-        target_frame.pack(fill=tk.X, padx=5, pady=2)
-        tk.Label(target_frame, text="対象:").pack(side=tk.LEFT)
-        self.combo_target = ttk.Combobox(target_frame, textvariable=self.target_var, state="readonly")
+        # ── 定期ループ開始 ──
+        self.after(UI_POLL_INTERVAL_MS, self._ui_update_loop)
+        self.after(HISTORY_POLL_INTERVAL_MS, self._history_poll_loop)
+        self.after(50, self._preview_loop)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self) -> None:
+        """メインUIを構築する."""
+        root = tk.Frame(self)
+        root.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self._build_source_section(root)
+        self._build_geometry_section(root)
+        self._build_preview_section(root)
+
+        # 初期状態を反映
+        self._on_geo_ctrl_changed()
+
+    def _build_source_section(self, parent: tk.Frame) -> None:
+        """対象選択セクションを構築する."""
+        group = tk.LabelFrame(parent, text="対象選択")
+        group.pack(fill=tk.X, pady=5)
+
+        # 検索フィルタ
+        row_filter = tk.Frame(group)
+        row_filter.pack(fill=tk.X, padx=5, pady=2)
+        tk.Label(row_filter, text="検索:").pack(side=tk.LEFT)
+        self.filter_var.trace_add("write", lambda *_: self.update_source_list())
+        tk.Entry(row_filter, textvariable=self.filter_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=5
+        )
+
+        # 対象コンボ
+        row_target = tk.Frame(group)
+        row_target.pack(fill=tk.X, padx=5, pady=2)
+        tk.Label(row_target, text="対象:").pack(side=tk.LEFT)
+        self.combo_target = ttk.Combobox(
+            row_target, textvariable=self.target_var, state="readonly"
+        )
         self.combo_target.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self.combo_target.bind("<<ComboboxSelected>>", self.on_target_changed)
-        tk.Button(target_frame, text="更新", command=self.update_source_list, width=4, bg=self.COLOR_BTN_UPDATE).pack(side=tk.LEFT)
+        self.combo_target.bind("<<ComboboxSelected>>", self._on_target_changed)
+        tk.Button(
+            row_target, text="更新", command=self.update_source_list, width=4, bg=self.COLOR_BTN
+        ).pack(side=tk.LEFT)
 
-        # 2. Geometry Settings
-        geo_group = tk.LabelFrame(main_frame, text="ウィンドウ位置・サイズ調整")
-        geo_group.pack(fill=tk.X, pady=5)
-        
-        geo_frame = tk.Frame(geo_group)
-        geo_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Maximize / Sync
-        self.check_max_geo = tk.Checkbutton(geo_frame, text="最大化", variable=self.max_geo_var, 
-                                            command=self._on_max_changed, indicatoron=False, 
-                                            selectcolor=self.COLOR_BTN_UPDATE, relief=tk.RAISED, overrelief=tk.RIDGE,
-                                            bg=self.COLOR_BTN_UPDATE)
+    def _build_geometry_section(self, parent: tk.Frame) -> None:
+        """位置・サイズ調整セクションを構築する."""
+        group = tk.LabelFrame(parent, text="ウィンドウ位置・サイズ調整")
+        group.pack(fill=tk.X, pady=5)
+
+        row = tk.Frame(group)
+        row.pack(fill=tk.X, padx=5, pady=5)
+
+        # 最大化 / 同期 / 画面外可
+        self.check_max_geo = tk.Checkbutton(
+            row, text="最大化", variable=self.max_geo_var,
+            command=self._on_max_changed, indicatoron=False,
+            selectcolor=self.COLOR_BTN, relief=tk.RAISED, overrelief=tk.RIDGE,
+            bg=self.COLOR_BTN,
+        )
         self.check_max_geo.pack(side=tk.LEFT, padx=(0, 2), ipadx=5)
-        
-        self.check_sync_geo = tk.Checkbutton(geo_frame, text="同期", variable=self.sync_geo_var, command=self._on_geo_ctrl_changed)
+
+        self.check_sync_geo = tk.Checkbutton(
+            row, text="同期", variable=self.sync_geo_var, command=self._on_geo_ctrl_changed
+        )
         self.check_sync_geo.pack(side=tk.LEFT, padx=(0, 2))
-        
-        self.check_allow_out = tk.Checkbutton(geo_frame, text="画面外可", variable=self.allow_out_of_bounds, command=self.apply_window_geometry)
+
+        self.check_allow_out = tk.Checkbutton(
+            row, text="画面外可", variable=self.allow_out_of_bounds,
+            command=self.apply_window_geometry,
+        )
         self.check_allow_out.pack(side=tk.LEFT, padx=(0, 5))
-        
-        # XYWH Spinboxes
-        tk.Label(geo_frame, text="X:").pack(side=tk.LEFT)
-        self.spin_x = tk.Spinbox(geo_frame, from_=-10000, to=10000, textvariable=self.geo_x, width=7, command=self._on_geo_spin_cmd)
-        self.spin_x.pack(side=tk.LEFT, padx=2)
-        
-        tk.Label(geo_frame, text="Y:").pack(side=tk.LEFT)
-        self.spin_y = tk.Spinbox(geo_frame, from_=-10000, to=10000, textvariable=self.geo_y, width=7, command=self._on_geo_spin_cmd)
-        self.spin_y.pack(side=tk.LEFT, padx=2)
-        
-        tk.Label(geo_frame, text="W:").pack(side=tk.LEFT)
-        self.spin_w = tk.Spinbox(geo_frame, from_=0, to=10000, textvariable=self.geo_w, width=7, command=self._on_geo_spin_cmd)
-        self.spin_w.pack(side=tk.LEFT, padx=2)
-        
-        tk.Label(geo_frame, text="H:").pack(side=tk.LEFT)
-        self.spin_h = tk.Spinbox(geo_frame, from_=0, to=10000, textvariable=self.geo_h, width=7, command=self._on_geo_spin_cmd)
-        self.spin_h.pack(side=tk.LEFT, padx=2)
-        
-        self.btn_apply_geo = tk.Button(geo_frame, text="適用", command=self.apply_window_geometry, width=4, bg=self.COLOR_BTN_UPDATE)
+
+        # X / Y / W / H Spinbox
+        spin_defs = [
+            ("X:", self.geo_x, -10000, 10000),
+            ("Y:", self.geo_y, -10000, 10000),
+            ("W:", self.geo_w, 0, 10000),
+            ("H:", self.geo_h, 0, 10000),
+        ]
+        self._spin_widgets: List[tk.Spinbox] = []
+        for label, var, lo, hi in spin_defs:
+            tk.Label(row, text=label).pack(side=tk.LEFT)
+            spin = tk.Spinbox(
+                row, from_=lo, to=hi, textvariable=var, width=7,
+                command=self._on_geo_spin_cmd,
+            )
+            spin.pack(side=tk.LEFT, padx=2)
+            self._spin_widgets.append(spin)
+
+        # 適用 / 戻す ボタン
+        self.btn_apply_geo = tk.Button(
+            row, text="適用", command=self.apply_window_geometry, width=4, bg=self.COLOR_BTN
+        )
         self.btn_apply_geo.pack(side=tk.LEFT, padx=5)
-        
-        self.btn_undo_geo = tk.Button(geo_frame, text="戻す", command=self.undo_geometry, width=4, bg=self.COLOR_BTN_UPDATE)
+
+        self.btn_undo_geo = tk.Button(
+            row, text="戻す", command=self._undo_geometry, width=4, bg=self.COLOR_BTN
+        )
         self.btn_undo_geo.pack(side=tk.LEFT, padx=5)
-        
-        # Bindings for spins
-        for spin in [self.spin_x, self.spin_y, self.spin_w, self.spin_h]:
-            spin.bind("<Return>", lambda e: self.apply_window_geometry())
-            spin.bind("<FocusOut>", lambda e: self.apply_window_geometry())
+
+        # Spinbox バインド（Enter / FocusOut / ホイール）
+        for spin in self._spin_widgets:
+            spin.bind("<Return>", lambda _: self.apply_window_geometry())
+            spin.bind("<FocusOut>", lambda _: self.apply_window_geometry())
             spin.bind("<MouseWheel>", self._on_geo_spin_wheel)
 
-        # Preview Frame (Moved to bottom)
-        preview_group = tk.LabelFrame(main_frame, text="プレビュー")
-        preview_group.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        self.preview_canvas = tk.Canvas(preview_group, bg="black")
+    def _build_preview_section(self, parent: tk.Frame) -> None:
+        """プレビューセクションを構築する."""
+        group = tk.LabelFrame(parent, text="プレビュー")
+        group.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.preview_canvas = tk.Canvas(group, bg="black")
         self.preview_canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self._on_sync_changed()
-
-    def _load_config(self):
-        config = load_global_config()
-        saved_source = config.get("recorder_source", "window")
-        self.source_var.set(saved_source)
-        
-    def update_source_list(self):
+    def update_source_list(self) -> None:
+        """ウィンドウ一覧を更新し、最適な対象を選択する."""
         filter_text = self.filter_var.get().lower()
-        values = []
         self.windows = self.window_utils.enum_windows(filter_text)
-        
-        for w in self.windows:
-            pname = w[2]
-            title = w[1]
-            pid = w[3]
-            values.append(f"[{pname}] {title} ({pid})")
-            
-        self.monitors = []
-        self.combo_target['values'] = values
-        if values:
-            best_idx = 0
-            if filter_text:
-                for i, v in enumerate(values):
-                    if f"[{filter_text}" in v.lower():
-                        best_idx = i
-                        break
-                    if filter_text in v.lower() and best_idx == 0:
-                        best_idx = i
-            
-            self.combo_target.current(best_idx)
-            self.on_target_changed(None)
-        else:
+
+        values = [
+            f"[{w[2]}] {w[1]} ({w[3]})" for w in self.windows
+        ]
+        self.combo_target["values"] = values
+
+        if not values:
             self.target_var.set("")
+            return
 
-    def on_target_changed(self, event):
-        mode = "window" 
-        rect = self._get_target_rect()
-        if rect:
-            self._reading_rect = True
-            self.geo_x.set(rect['left'])
-            self.geo_y.set(rect['top'])
-            self.geo_w.set(rect['width'])
-            self.geo_h.set(rect['height'])
-            self._reading_rect = False
-            
-            idx = self.combo_target.current()
-            hwnd = None
-            if mode == 'window' and 0 <= idx < len(self.windows):
-                hwnd = self.windows[idx][0]
+        best_idx = self._find_best_match(values, filter_text)
+        self.combo_target.current(best_idx)
+        self._on_target_changed(None)
 
-            # 対象変更時（hwndが変わった時）のみ履歴をリセット
-            if self.last_state is None or (hwnd and self.last_state[0] != hwnd):
-                self.history.clear()
-                if hwnd:
-                    self.last_state = (hwnd, rect['left'], rect['top'], rect['width'], rect['height'], self.window_utils.is_window_maximized(hwnd))
-                else:
-                    self.last_state = None
-                self.btn_undo_geo.config(state=tk.DISABLED)
-            
-            if mode == 'window' and hwnd:
-                # Clean up old
-                if self.wgc_capture:
-                    self.wgc_capture.close()
-                    self.wgc_capture = None
-                    
-                if WGC_AVAILABLE:
-                    try:
-                        self.wgc_capture = WGCCapture(hwnd)
-                    except Exception as e:
-                        print(f"Preview Start Error: {e}")
-                
-                # Check if window can be maximized
-                if self.window_utils.can_maximize(hwnd):
-                    self.check_max_geo.config(state=tk.NORMAL)
-                else:
-                    self.check_max_geo.config(state=tk.DISABLED)
-                    self.max_geo_var.set(False)
+    @staticmethod
+    def _find_best_match(values: List[str], filter_text: str) -> int:
+        """フィルタに最も合致するインデックスを返す."""
+        if not filter_text:
+            return 0
+        best = 0
+        for i, v in enumerate(values):
+            lower = v.lower()
+            if f"[{filter_text}" in lower:
+                return i
+            if filter_text in lower and best == 0:
+                best = i
+        return best
 
-    def _get_target_rect(self) -> Optional[Dict[str, int]]:
-        mode = "window" # Fixed
+    def _get_target_hwnd(self) -> Optional[Any]:
+        """選択中のウィンドウハンドルを返す。未選択なら None."""
         idx = self.combo_target.current()
-        if mode == 'window':
-            if idx >= 0 and idx < len(self.windows):
-                hwnd = self.windows[idx][0]
-                return self.window_utils.get_window_rect(hwnd)
+        if 0 <= idx < len(self.windows):
+            return self.windows[idx][0]
         return None
 
-    def apply_window_geometry(self):
-        if not self.max_geo_var.get():
-            idx = self.combo_target.current()
-            if idx >= 0 and idx < len(self.windows):
-                hwnd = self.windows[idx][0]
-                try:
-                    tx = self.geo_x.get()
-                    ty = self.geo_y.get()
-                    tw = self.geo_w.get()
-                    th = self.geo_h.get()
+    def _get_target_rect(self) -> Optional[Dict[str, int]]:
+        """選択中ウィンドウの矩形情報を返す."""
+        hwnd = self._get_target_hwnd()
+        if hwnd is not None:
+            return self.window_utils.get_window_rect(hwnd)
+        return None
 
-                    curr_rect = self.window_utils.get_window_rect(hwnd)
-                    if not curr_rect:
-                        return
+    def _on_target_changed(self, _event: Any) -> None:
+        """対象ウィンドウが変わった時の処理."""
+        rect = self._get_target_rect()
+        if not rect:
+            return
 
-                    monitors = self.window_utils.get_monitor_info()
-                    if not monitors:
-                        self.window_utils.set_window_position(hwnd, tx, ty, tw, th)
-                        return
+        # UI にウィンドウ座標を反映（再帰防止付き）
+        self._set_geo_vars(rect)
 
-                    cx = curr_rect['left'] + curr_rect['width'] // 2
-                    cy = curr_rect['top'] + curr_rect['height'] // 2
-                    
-                    target_monitor = monitors[0]
-                    for m in monitors:
-                        if m['left'] <= cx < m['left'] + m['width'] and m['top'] <= cy < m['top'] + m['height']:
-                            target_monitor = m
-                            break
-                    
-                    m_left = target_monitor['left']
-                    m_top = target_monitor['top']
-                    m_right = m_left + target_monitor['width']
-                    m_bottom = m_top + target_monitor['height']
+        hwnd = self._get_target_hwnd()
+        if hwnd is None:
+            return
 
-                    # 境界チェックと自動調整
-                    if not self.allow_out_of_bounds.get():
-                        work_areas = self.window_utils.get_workarea_info()
-                        if work_areas:
-                            target_work = work_areas[0]
-                            for wa in work_areas:
-                                if (wa['left'] < m_right and wa['left'] + wa['width'] > m_left and 
-                                    wa['top'] < m_bottom and wa['top'] + wa['height'] > m_top):
-                                    target_work = wa
-                                    break
-                            m_left, m_top = target_work['left'], target_work['top']
-                            m_right, m_bottom = m_left + target_work['width'], m_top + target_work['height']
+        # hwnd が変わった場合のみ履歴をリセット
+        if self.last_state is None or self.last_state[0] != hwnd:
+            self.history.clear()
+            self.last_state = self._make_state(hwnd, rect)
+            self.btn_undo_geo.config(state=tk.DISABLED)
 
-                        # サイズをモニター内に収める
-                        m_w = m_right - m_left
-                        m_h = m_bottom - m_top
-                        if tw > m_w: tw = m_w
-                        if th > m_h: th = m_h
+        # WGC キャプチャの再初期化
+        self._reset_wgc_capture(hwnd)
 
-                        # 位置を調整してモニター内に収める (サイズ維持優先)
-                        if tx < m_left: tx = m_left
-                        if ty < m_top: ty = m_top
-                        if tx + tw > m_right: tx = m_right - tw
-                        if ty + th > m_bottom: ty = m_bottom - th
+        # 最大化ボタンの有効・無効を制御
+        if self.window_utils.can_maximize(hwnd):
+            self.check_max_geo.config(state=tk.NORMAL)
+        else:
+            self.check_max_geo.config(state=tk.DISABLED)
+            self.max_geo_var.set(False)
 
-                        # 最小サイズの担保
-                        if tw < 32: tw = 32
-                        if th < 32: th = 32
-                        
-                        # サイズ変更後の再位置調整
-                        if tx + tw > m_right: tx = m_right - tw
-                        if ty + th > m_bottom: ty = m_bottom - th
-                        if tx < m_left: tx = m_left
-                        if ty < m_top: ty = m_top
+    def _reset_wgc_capture(self, hwnd: Any) -> None:
+        """WGC キャプチャを再起動する."""
+        if self.wgc_capture:
+            self.wgc_capture.close()
+            self.wgc_capture = None
+        if WGC_AVAILABLE:
+            try:
+                self.wgc_capture = WGCCapture(hwnd)
+            except Exception as e:
+                print(f"Preview Start Error: {e}")
 
-                    # UIに調整結果を反映
-                    if tx != self.geo_x.get() or ty != self.geo_y.get() or tw != self.geo_w.get() or th != self.geo_h.get():
-                        self._reading_rect = True
-                        self.geo_x.set(tx)
-                        self.geo_y.set(ty)
-                        self.geo_w.set(tw)
-                        self.geo_h.set(th)
-                        self._reading_rect = False
+    def apply_window_geometry(self) -> None:
+        """UI 上の座標値を対象ウィンドウに適用する."""
+        if self.max_geo_var.get():
+            return
 
-                    # 適用
-                    self.window_utils.set_window_position(hwnd, tx, ty, tw, th)
+        hwnd = self._get_target_hwnd()
+        if hwnd is None:
+            return
 
-                except tk.TclError:
-                    pass
-                except Exception as e:
-                    print(f"Geometry apply error: {e}")
+        try:
+            tx, ty, tw, th = (
+                self.geo_x.get(), self.geo_y.get(),
+                self.geo_w.get(), self.geo_h.get(),
+            )
+        except (tk.TclError, ValueError):
+            return
 
-    def _on_max_changed(self):
+        curr_rect = self.window_utils.get_window_rect(hwnd)
+        if not curr_rect:
+            return
+
+        # 境界制限の適用
+        if not self.allow_out_of_bounds.get():
+            bounds = self._get_work_bounds(curr_rect)
+            if bounds:
+                tx, ty, tw, th = self._clamp_to_bounds(tx, ty, tw, th, *bounds)
+
+        # UIに調整結果を反映
+        self._sync_geo_if_changed(tx, ty, tw, th)
+
+        # ウィンドウに反映
+        try:
+            self.window_utils.set_window_position(hwnd, tx, ty, tw, th)
+        except Exception as e:
+            print(f"Geometry apply error: {e}")
+
+    def _get_work_bounds(self, curr_rect: Dict[str, int]) -> Optional[Tuple[int, int, int, int]]:
+        """ウィンドウ中心が属するモニターの作業領域 (left, top, right, bottom) を返す."""
+        monitors = self.window_utils.get_monitor_info()
+        if not monitors:
+            return None
+
+        # ウィンドウ中心で対象モニターを特定
+        cx = curr_rect['left'] + curr_rect['width'] // 2
+        cy = curr_rect['top'] + curr_rect['height'] // 2
+        target = monitors[0]
+        for m in monitors:
+            if m['left'] <= cx < m['left'] + m['width'] and m['top'] <= cy < m['top'] + m['height']:
+                target = m
+                break
+
+        m_left, m_top = target['left'], target['top']
+        m_right = m_left + target['width']
+        m_bottom = m_top + target['height']
+
+        # 作業領域（タスクバー除外）があればそちらを優先
+        work_areas = self.window_utils.get_workarea_info()
+        if work_areas:
+            target_work = work_areas[0]
+            for wa in work_areas:
+                if (wa['left'] < m_right and wa['left'] + wa['width'] > m_left
+                        and wa['top'] < m_bottom and wa['top'] + wa['height'] > m_top):
+                    target_work = wa
+                    break
+            m_left, m_top = target_work['left'], target_work['top']
+            m_right = m_left + target_work['width']
+            m_bottom = m_top + target_work['height']
+
+        return m_left, m_top, m_right, m_bottom
+
+    @staticmethod
+    def _clamp_to_bounds(
+        tx: int, ty: int, tw: int, th: int,
+        m_left: int, m_top: int, m_right: int, m_bottom: int,
+    ) -> Tuple[int, int, int, int]:
+        """座標・サイズをモニター境界内に収める（サイズ維持優先）."""
+        m_w, m_h = m_right - m_left, m_bottom - m_top
+
+        # サイズをモニター内に収める
+        tw = min(tw, m_w)
+        th = min(th, m_h)
+
+        # 位置を調整してモニター内に収める
+        tx = max(tx, m_left)
+        ty = max(ty, m_top)
+        if tx + tw > m_right:
+            tx = m_right - tw
+        if ty + th > m_bottom:
+            ty = m_bottom - th
+
+        # 最小サイズの担保
+        tw = max(tw, MIN_WINDOW_SIZE)
+        th = max(th, MIN_WINDOW_SIZE)
+
+        # 最小サイズ適用後の再位置調整
+        if tx + tw > m_right:
+            tx = m_right - tw
+        if ty + th > m_bottom:
+            ty = m_bottom - th
+        tx = max(tx, m_left)
+        ty = max(ty, m_top)
+
+        return tx, ty, tw, th
+
+    def _on_max_changed(self) -> None:
+        """最大化チェック変更時の処理."""
         is_max = self.max_geo_var.get()
         state = tk.DISABLED if is_max else tk.NORMAL
-        for w in [self.spin_x, self.spin_y, self.spin_w, self.spin_h, self.check_sync_geo]:
+        for w in self._spin_widgets + [self.check_sync_geo]:
             w.config(state=state)
-            
-        idx = self.combo_target.current()
-        if idx >= 0 and idx < len(self.windows):
-            hwnd = self.windows[idx][0]
+
+        hwnd = self._get_target_hwnd()
+        if hwnd is not None:
             if is_max:
                 self.check_max_geo.config(relief=tk.SUNKEN)
-                ctypes.windll.user32.ShowWindow(hwnd, 3) # SW_MAXIMIZE
+                ctypes.windll.user32.ShowWindow(hwnd, SW_MAXIMIZE)
             else:
                 self.check_max_geo.config(relief=tk.RAISED)
-                ctypes.windll.user32.ShowWindow(hwnd, 1) # SW_NORMAL
-                self.apply_window_geometry() # Restore size
-        
+                ctypes.windll.user32.ShowWindow(hwnd, SW_NORMAL)
+                self.apply_window_geometry()
+
         # 最大化・解除時は瞬時に履歴を確定させる
         self._record_history_step()
 
-    def _on_geo_spin_cmd(self):
-        """Spinboxの矢印等で値が変わった時の反映"""
+    def _on_geo_spin_cmd(self) -> None:
+        """Spinbox の矢印ボタンで値が変わった時の反映."""
         if self.sync_geo_var.get() and not self.max_geo_var.get():
             self.apply_window_geometry()
 
-    def _history_poll_loop(self):
-        """0.5秒おきに状態をチェックして履歴に保存する"""
-        self._record_history_step()
-        self.after(500, self._history_poll_loop)
-
-    def _record_history_step(self):
-        """現在の状態をチェックし、変化があれば履歴に保存する"""
-        try:
-            rect = self._get_target_rect()
-            if rect:
-                idx = self.combo_target.current()
-                if idx >= 0 and idx < len(self.windows):
-                    hwnd = self.windows[idx][0]
-                    is_max = self.window_utils.is_window_maximized(hwnd)
-                    new_state = (hwnd, rect['left'], rect['top'], rect['width'], rect['height'], is_max)
-                    
-                    # 左クリック状態を確認 (0x01)
-                    is_dragging = ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000
-                    
-                    # 座標変化の保存は「クリック中でない」とき。
-                    # ただし「最大化フラグのみの変化」はクリック中（ボタン押し中）でも即座に保存して良い
-                    is_max_changed = (self.last_state and self.last_state[5] != is_max)
-                    
-                    if not is_dragging or is_max_changed:
-                        if self.last_state is None:
-                            self.last_state = new_state
-                        elif new_state != self.last_state:
-                            # 状態が変わっていたら履歴に積む
-                            self.history.append(self.last_state)
-                            if len(self.history) > 100:
-                                self.history.pop(0)
-                            self.last_state = new_state
-            
-            # 戻すボタンの有効・無効切り替え
-            state = tk.NORMAL if self.history else tk.DISABLED
-            if self.btn_undo_geo['state'] != state:
-                self.btn_undo_geo.config(state=state)
-                
-        except Exception:
-            pass
-
-    def undo_geometry(self):
-        """1手戻す"""
-        if not self.history:
-            return
-        
-        target_state = self.history.pop()
-        last_hwnd, tx, ty, tw, th, is_max = target_state
-        self.last_state = target_state
-        
-        self.window_utils.set_window_maximized(last_hwnd, is_max)
-        
-        idx = self.combo_target.current()
-        if idx >= 0 and idx < len(self.windows) and self.windows[idx][0] == last_hwnd:
-            self._reading_rect = True
-            self.geo_x.set(tx)
-            self.geo_y.set(ty)
-            self.geo_w.set(tw)
-            self.geo_h.set(th)
-            self.max_geo_var.set(is_max)
-            self.check_max_geo.config(relief=tk.SUNKEN if is_max else tk.RAISED)
-            self._reading_rect = False
-        
-        if not is_max:
-            self.window_utils.set_window_position(last_hwnd, tx, ty, tw, th)
-
-    def _on_geo_ctrl_changed(self):
-        is_sync = self.sync_geo_var.get()
-        if is_sync:
-            self.btn_apply_geo.config(state=tk.DISABLED)
-            self.on_target_changed(None)
-        else:
-            self.btn_apply_geo.config(state=tk.NORMAL)
-
-    def _ui_update_loop(self):
-        """Poll window position and update UI if Sync/Maximize is enabled"""
-        try:
-            rect = self._get_target_rect()
-            
-            # 1. Update Maximize State
-            if rect:
-                idx = self.combo_target.current()
-                if idx >= 0 and idx < len(self.windows):
-                    hwnd = self.windows[idx][0]
-                    if self.window_utils.is_window_maximized(hwnd):
-                        if not self.max_geo_var.get():
-                            self.max_geo_var.set(True)
-                            self.check_max_geo.config(relief=tk.SUNKEN)
-                            self._on_geo_ctrl_changed()
-                    else:
-                        if self.max_geo_var.get():
-                            self.max_geo_var.set(False)
-                            self.check_max_geo.config(relief=tk.RAISED)
-                            self._on_geo_ctrl_changed()
-                    
-                    self._record_history_step()
-
-            # 2. Update Geometry UI
-            try:
-                focused_widget = self.focus_get()
-            except:
-                focused_widget = None
-
-            is_max = self.max_geo_var.get()
-            is_sync = self.sync_geo_var.get()
-            allow_out = self.allow_out_of_bounds.get()
-            
-            input_widgets = [self.spin_x, self.spin_y, self.spin_w, self.spin_h]
-            if (is_sync or is_max or not allow_out) and (focused_widget not in input_widgets):
-                if rect:
-                    tx, ty, tw, th = rect['left'], rect['top'], rect['width'], rect['height']
-                    
-                    if not allow_out and not is_max:
-                        work_areas = self.window_utils.get_workarea_info()
-                        if work_areas:
-                            cx = tx + tw // 2
-                            cy = ty + th // 2
-                            target_work = work_areas[0]
-                            for wa in work_areas:
-                                if wa['left'] <= cx < wa['left'] + wa['width'] and wa['top'] <= cy < wa['top'] + wa['height']:
-                                    target_work = wa
-                                    break
-                            m_left, m_top = target_work['left'], target_work['top']
-                            m_right, m_bottom = m_left + target_work['width'], m_top + target_work['height']
-                            
-                            adjusted = False
-                            if tx < m_left:
-                                diff = m_left - tx
-                                tw -= diff
-                                tx = m_left
-                                adjusted = True
-                            if ty < m_top:
-                                diff = m_top - ty
-                                th -= diff
-                                ty = m_top
-                                adjusted = True
-                            if tx + tw > m_right: tw = m_right - tx; adjusted = True
-                            if ty + th > m_bottom: th = m_bottom - ty; adjusted = True
-                            if tw < 32: tw = 32; adjusted = True
-                            if th < 32: th = 32; adjusted = True
-                            
-                            if adjusted:
-                                if tx + tw > m_right: tx = m_right - tw
-                                if ty + th > m_bottom: ty = m_bottom - th
-                                if tx < m_left: tx = m_left
-                                if ty < m_top: ty = m_top
-                                idx = self.combo_target.current()
-                                if idx >= 0 and idx < len(self.windows):
-                                    hwnd = self.windows[idx][0]
-                                    self.window_utils.set_window_position(hwnd, tx, ty, tw, th)
-
-                    try:
-                        self._reading_rect = True
-                        if self.geo_x.get() != tx: self.geo_x.set(tx)
-                        if self.geo_y.get() != ty: self.geo_y.set(ty)
-                        if self.geo_w.get() != tw: self.geo_w.set(tw)
-                        if self.geo_h.get() != th: self.geo_h.set(th)
-                    except tk.TclError:
-                        pass
-                    finally:
-                        self._reading_rect = False
-                        
-        except Exception:
-            pass
-        self.after(200, self._ui_update_loop)
-
-    def _start_preview(self):
-        try:
-            has_wgc_frame = False
-            if self.wgc_capture:
-                frame = self.wgc_capture.get_latest_frame()
-                if frame is not None:
-                    self._update_preview_canvas(frame)
-                    has_wgc_frame = True
-            if not has_wgc_frame:
-                self._try_fallback_preview()
-        except Exception:
-            pass
-        interval = 33 if (self.wgc_capture and self.wgc_capture.session) else 200
-        self.after(interval, self._start_preview)
-
-    def _try_fallback_preview(self):
-        idx = self.combo_target.current()
-        if idx >= 0 and idx < len(self.windows):
-            hwnd = self.windows[idx][0]
-            try:
-                frame = self.window_utils.capture_exclusive_window(hwnd)
-                if frame is not None:
-                    self._update_preview_canvas(frame)
-            except Exception:
-                pass
-
-    def _update_preview_canvas(self, frame):
-        try:
-            cw = self.preview_canvas.winfo_width()
-            ch = self.preview_canvas.winfo_height()
-            if cw > 1 and ch > 1:
-                h, w = frame.shape[:2]
-                ratio = min(cw / w, ch / h)
-                new_w, new_h = int(w * ratio), int(h * ratio)
-                if new_w > 0 and new_h > 0:
-                    frame = cv2.resize(frame, (new_w, new_h))
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    tk_img = ImageTk.PhotoImage(Image.fromarray(frame_rgb))
-                    x, y = (cw - new_w) // 2, (ch - new_h) // 2
-                    if self.preview_image_id:
-                        self.preview_canvas.itemconfig(self.preview_image_id, image=tk_img)
-                        self.preview_canvas.coords(self.preview_image_id, x, y)
-                    else:
-                        self.preview_image_id = self.preview_canvas.create_image(x, y, image=tk_img, anchor=tk.NW)
-                    self.preview_canvas.image = tk_img
-        except Exception:
-            pass
-
-    def _on_sync_changed(self):
-        self._on_geo_ctrl_changed()
-
-    def _on_geo_spin_wheel(self, event):
+    def _on_geo_spin_wheel(self, event: tk.Event) -> str:
+        """Spinbox 上のホイール操作を処理する."""
         delta = 1 if event.delta > 0 else -1
         widget: tk.Spinbox = event.widget
         try:
@@ -591,11 +435,210 @@ class ChunapTool(tk.Tk):
             widget.insert(0, str(curr + delta))
             if self.sync_geo_var.get() and not self.max_geo_var.get():
                 self.apply_window_geometry()
-        except:
+        except (ValueError, tk.TclError):
             pass
         return "break"
 
-    def on_close(self):
+    def _on_geo_ctrl_changed(self) -> None:
+        """同期チェック変更時の処理."""
+        if self.sync_geo_var.get():
+            self.btn_apply_geo.config(state=tk.DISABLED)
+            self._on_target_changed(None)
+        else:
+            self.btn_apply_geo.config(state=tk.NORMAL)
+
+    def _history_poll_loop(self) -> None:
+        """定期的に状態をチェックし、変化があれば履歴に保存する."""
+        self._record_history_step()
+        self.after(HISTORY_POLL_INTERVAL_MS, self._history_poll_loop)
+
+    def _record_history_step(self) -> None:
+        """現在のウィンドウ状態を確認し、変化があれば履歴に積む."""
+        try:
+            rect = self._get_target_rect()
+            hwnd = self._get_target_hwnd()
+            if not rect or hwnd is None:
+                return
+
+            is_max = self.window_utils.is_window_maximized(hwnd)
+            new_state = self._make_state(hwnd, rect, is_max)
+
+            # ドラッグ中は保存しない（ただし最大化フラグの変化は即座に保存）
+            is_dragging = ctypes.windll.user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000
+            is_max_changed = self.last_state is not None and self.last_state[5] != is_max
+
+            if not is_dragging or is_max_changed:
+                if self.last_state is None:
+                    self.last_state = new_state
+                elif new_state != self.last_state:
+                    self.history.append(self.last_state)
+                    if len(self.history) > MAX_HISTORY:
+                        self.history.pop(0)
+                    self.last_state = new_state
+
+            # 「戻す」ボタンの有効・無効を更新
+            expected = tk.NORMAL if self.history else tk.DISABLED
+            if str(self.btn_undo_geo["state"]) != str(expected):
+                self.btn_undo_geo.config(state=expected)
+
+        except Exception:
+            pass
+
+    def _undo_geometry(self) -> None:
+        """直前の状態に1手戻す."""
+        if not self.history:
+            return
+
+        target_state = self.history.pop()
+        last_hwnd, tx, ty, tw, th, is_max = target_state
+        self.last_state = target_state
+
+        # 最大化状態を復元
+        self.window_utils.set_window_maximized(last_hwnd, is_max)
+
+        # 現在選択中のウィンドウと同じ場合、UIを更新
+        if self._get_target_hwnd() == last_hwnd:
+            self._reading_rect = True
+            self.geo_x.set(tx)
+            self.geo_y.set(ty)
+            self.geo_w.set(tw)
+            self.geo_h.set(th)
+            self.max_geo_var.set(is_max)
+            self.check_max_geo.config(relief=tk.SUNKEN if is_max else tk.RAISED)
+            self._reading_rect = False
+
+        if not is_max:
+            self.window_utils.set_window_position(last_hwnd, tx, ty, tw, th)
+
+    def _ui_update_loop(self) -> None:
+        """UI 更新ループ."""
+        try:
+            rect = self._get_target_rect()
+            hwnd = self._get_target_hwnd()
+
+            if rect and hwnd is not None:
+                self._sync_maximize_state(hwnd)
+                self._record_history_step()
+
+            self._sync_geometry_ui(rect, hwnd)
+        except Exception:
+            pass
+        self.after(UI_POLL_INTERVAL_MS, self._ui_update_loop)
+
+    def _sync_maximize_state(self, hwnd: Any) -> None:
+        """ウィンドウの実際の最大化状態をUIに反映する."""
+        actual_max = self.window_utils.is_window_maximized(hwnd)
+        ui_max = self.max_geo_var.get()
+        if actual_max != ui_max:
+            self.max_geo_var.set(actual_max)
+            self.check_max_geo.config(relief=tk.SUNKEN if actual_max else tk.RAISED)
+            self._on_geo_ctrl_changed()
+
+    def _sync_geometry_ui(self, rect: Optional[Dict[str, int]], hwnd: Optional[Any]) -> None:
+        """座標情報を UI に反映する."""
+        try:
+            focused = self.focus_get()
+        except (KeyError, tk.TclError):
+            focused = None
+
+        is_max = self.max_geo_var.get()
+        is_sync = self.sync_geo_var.get()
+        allow_out = self.allow_out_of_bounds.get()
+
+        if focused in self._spin_widgets:
+            return
+        if not (is_sync or is_max or not allow_out):
+            return
+        if not rect:
+            return
+
+        tx, ty, tw, th = rect['left'], rect['top'], rect['width'], rect['height']
+
+        if not allow_out and not is_max and hwnd is not None:
+            bounds = self._get_work_bounds(rect)
+            if bounds:
+                new_tx, new_ty, new_tw, new_th = self._clamp_to_bounds(tx, ty, tw, th, *bounds)
+                if (new_tx, new_ty, new_tw, new_th) != (tx, ty, tw, th):
+                    tx, ty, tw, th = new_tx, new_ty, new_tw, new_th
+                    self.window_utils.set_window_position(hwnd, tx, ty, tw, th)
+
+        self._sync_geo_if_changed(tx, ty, tw, th)
+
+    def _preview_loop(self) -> None:
+        """プレビュー更新ループ."""
+        try:
+            frame = self._capture_preview_frame()
+            if frame is not None:
+                self._draw_preview(frame)
+        except Exception:
+            pass
+        interval = (
+            PREVIEW_WGC_INTERVAL_MS
+            if self.wgc_capture and self.wgc_capture.session
+            else PREVIEW_FALLBACK_INTERVAL_MS
+        )
+        self.after(interval, self._preview_loop)
+
+    def _capture_preview_frame(self) -> Optional["cv2.Mat"]:
+        """キャプチャフレームを取得."""
+        if self.wgc_capture:
+            frame = self.wgc_capture.get_latest_frame()
+            if frame is not None:
+                return frame
+        hwnd = self._get_target_hwnd()
+        if hwnd is not None:
+            try:
+                return self.window_utils.capture_exclusive_window(hwnd)
+            except Exception:
+                pass
+        return None
+
+    def _draw_preview(self, frame: "cv2.Mat") -> None:
+        """キャンバスに描画."""
+        cw, ch = self.preview_canvas.winfo_width(), self.preview_canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        fh, fw = frame.shape[:2]
+        ratio = min(cw / fw, ch / fh)
+        nw, nh = int(fw * ratio), int(fh * ratio)
+        if nw <= 0 or nh <= 0:
+            return
+        resized = cv2.resize(frame, (nw, nh))
+        tk_img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
+        x, y = (cw - nw) // 2, (ch - nh) // 2
+        if self.preview_image_id:
+            self.preview_canvas.itemconfig(self.preview_image_id, image=tk_img)
+            self.preview_canvas.coords(self.preview_image_id, x, y)
+        else:
+            self.preview_image_id = self.preview_canvas.create_image(x, y, image=tk_img, anchor=tk.NW)
+        self.preview_canvas.image = tk_img
+
+    def _set_geo_vars(self, rect: Dict[str, int]) -> None:
+        """UI 変数を更新."""
+        self._reading_rect = True
+        self.geo_x.set(rect['left'])
+        self.geo_y.set(rect['top'])
+        self.geo_w.set(rect['width'])
+        self.geo_h.set(rect['height'])
+        self._reading_rect = False
+
+    def _sync_geo_if_changed(self, tx: int, ty: int, tw: int, th: int) -> None:
+        """差分がある時のみ UI 変数を更新."""
+        if (tx != self.geo_x.get() or ty != self.geo_y.get() or tw != self.geo_w.get() or th != self.geo_h.get()):
+            self._reading_rect = True
+            self.geo_x.set(tx)
+            self.geo_y.set(ty)
+            self.geo_w.set(tw)
+            self.geo_h.set(th)
+            self._reading_rect = False
+
+    @staticmethod
+    def _make_state(hwnd: Any, rect: Dict[str, int], is_max: bool = False) -> GeoState:
+        """GeoState 生成."""
+        return (hwnd, rect['left'], rect['top'], rect['width'], rect['height'], is_max)
+
+    def _on_close(self) -> None:
+        """終了処理."""
         if self.wgc_capture:
             self.wgc_capture.close()
         self.destroy()
