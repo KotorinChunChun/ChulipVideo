@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import sys
 
 import cv2
-import screen_recorder
+import CapchunScreen
 import overlay_utils
 from PIL import Image, ImageTk
 
@@ -270,7 +270,7 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
 
         # 録画ツール起動ボタン (赤系 -> Theme)
         btn_bg = self.theme.get("main_color")
-        btn_rec = tk.Button(top_panel, text="🎥録画", command=self.open_screen_recorder,
+        btn_rec = tk.Button(top_panel, text="🎥録画", command=self.open_CapchunScreen,
                   bg=btn_bg, width=6, font=top_font)
         btn_rec.pack(side=tk.LEFT, padx=5)
         self.add_tooltip(btn_rec, "録画ツールを起動する")
@@ -1883,9 +1883,9 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
         except Exception:
             pass
 
-    def open_screen_recorder(self):
-        """スクリーンレコーダーを起動"""
-        app = screen_recorder.ScreenRecorderApp(self.root, parent_app=self)
+    def open_CapchunScreen(self):
+        """録画ツールを起動"""
+        app = CapchunScreen.CapchunScreenApp(self.root, parent_app=self)
 
     def open_video_file(self, result_path):
         """外部から指定された動画ファイルを開く"""

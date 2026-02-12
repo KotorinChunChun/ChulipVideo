@@ -15,7 +15,7 @@ from window_utils import WindowUtils
 from wgc_capture import WGCCapture
 
 
-class ScreenRecorderLogic:
+class CapchunScreenLogic:
     """録画処理の実行・管理を行うクラス."""
 
     def __init__(self, window_utils: WindowUtils):

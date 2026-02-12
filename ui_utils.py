@@ -142,7 +142,7 @@ class WindowGeometryMixin:
             config[f"{prefix}window_y"] = self.root.winfo_y()
             config[f"{prefix}window_width"] = self.root.winfo_width()
             config[f"{prefix}window_height"] = self.root.winfo_height()
-            # geometry文字列も保存（screen_recorder互換用）
+            # geometry文字列も保存（CapchunScreen互換用）
             config[f"{prefix}geometry"] = self.root.geometry()
         
         save_global_config(config)

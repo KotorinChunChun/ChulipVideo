@@ -1,4 +1,4 @@
-"""画面録画機能モジュール
+"""画面録画機能モジュール - CapchunScreen
 
 メインアプリケーションから呼び出される録画を行うためのウィンドウ。
 """
@@ -28,7 +28,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 import overlay_utils
 from config import PROJECT_NAME, PROJECT_VERSION, get_base_dir, load_global_config, save_global_config
-from recorder_core import ScreenRecorderLogic
+from recorder_core import CapchunScreenLogic
 from shortcut_manager import ShortcutManager
 from shortcut_settings_dialog import ShortcutSettingsDialog
 from ui_utils import add_tooltip
@@ -36,6 +36,7 @@ from utils import resource_path
 from window_utils import WindowUtils
 from multi_video_player import MultiVideoManager
 
+WINDOW_NAME = "CapchunScreen"
 
 # 仮想カメラライブラリのインポート試行
 try:
@@ -119,7 +120,7 @@ class IndependentPreviewWindow(tk.Toplevel):
         # overrideredirect(True) を使うとOBSで認識されないため False。
         # 代わりに Windows API でスタイルを剥ぎ取る。
         self.overrideredirect(False)
-        self.title(f"{PROJECT_NAME} - 録画プレビューツール")
+        self.title(f"{WINDOW_NAME} - 録画プレビューツール")
         
         self.attributes("-topmost", True)
         self.canvas = tk.Canvas(self, bg="black", highlightthickness=0)
@@ -213,7 +214,7 @@ class IndependentPreviewWindow(tk.Toplevel):
         self.lift()
         self.attributes("-topmost", True) # 念のため再度セット
 
-class ScreenRecorderApp:
+class CapchunScreenApp:
     """デスクトップ録画ツール.
     
     このクラスはスタンドアロンで起動することも、親アプリ
@@ -242,7 +243,7 @@ class ScreenRecorderApp:
     
     def __init__(self, root: Optional[tk.Tk] = None, parent_app: Optional[VideoCropperApp] = None):
         self.window_utils = WindowUtils()
-        self.recorder_logic = ScreenRecorderLogic(self.window_utils)
+        self.recorder_logic = CapchunScreenLogic(self.window_utils)
 
         if root is None:
             self.root = tk.Tk()
@@ -251,7 +252,7 @@ class ScreenRecorderApp:
             self.root = tk.Toplevel(root)
             self.standalone = False
             
-        self.root.title(f"{PROJECT_NAME} - 録画ツール")
+        self.root.title(f"{WINDOW_NAME} - 画面録画ツール")
         self.parent_app = parent_app
         
         # アイコン設定
@@ -294,7 +295,7 @@ class ScreenRecorderApp:
     def _init_variables(self):
         """メンバ変数の初期化"""
         self.window_utils = WindowUtils()
-        self.recorder_logic = ScreenRecorderLogic(self.window_utils)
+        self.recorder_logic = CapchunScreenLogic(self.window_utils)
 
         # ショートカット管理
         self.shortcut_manager = ShortcutManager(os.path.join(get_base_dir(), "shortcuts.tsv"))
@@ -427,7 +428,7 @@ class ScreenRecorderApp:
         """二重起動チェック。既に起動している場合は前面に出して終了。"""
         if not self.standalone:
             return True
-        return self.window_utils.check_single_instance(f"{PROJECT_NAME}ScreenRecorder_Mutex", "録画ツール")
+        return self.window_utils.check_single_instance(f"{WINDOW_NAME}_Mutex", "画面録画ツール")
 
     def load_window_geometry(self):
         """設定からウィンドウの状態を復元."""
@@ -2436,7 +2437,7 @@ class ScreenRecorderApp:
                          if not self.shortcut_manager.is_allowed_playback(combo):
                               keys = "None"
 
-                    # 2. Mouse (ScreenRecorderLogic saves click separately)
+                    # 2. Mouse (CapchunScreenLogic saves click separately)
                     # But ShortcutManager might treat "Ctrl+L-Click" as a combo.
                     # We need to check if the mouse click (with modifiers) is allowed.
                     if click and click != "None":
@@ -2606,5 +2607,5 @@ class ScreenRecorderApp:
         from ui_utils import fix_button_active_colors
         fix_button_active_colors(container)
 if __name__ == "__main__":
-    app = ScreenRecorderApp()
+    app = CapchunScreenApp()
     app.root.mainloop()
