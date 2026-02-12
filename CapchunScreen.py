@@ -2630,6 +2630,9 @@ class CapchunScreenApp:
         """コンテナ内の全ボタンの activebackground を背景色に合わせる."""
         from ui_utils import fix_button_active_colors
         fix_button_active_colors(container)
-if __name__ == "__main__":
+def main():
     app = CapchunScreenApp()
     app.root.mainloop()
+
+if __name__ == "__main__":
+    main()

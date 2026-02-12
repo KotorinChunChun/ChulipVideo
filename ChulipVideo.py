@@ -2910,7 +2910,10 @@ class VideoCropperApp(SeekbarMixin, CropHandlerMixin, ExportMixin):
                 except Exception:
                     pass
 
-if __name__ == "__main__":
+def main():
     root = tk.Tk()
     VideoCropperApp(root)
     root.mainloop()
+
+if __name__ == "__main__":
+    main()

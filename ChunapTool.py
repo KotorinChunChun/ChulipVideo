@@ -643,6 +643,9 @@ class ChunapTool(tk.Tk):
             self.wgc_capture.close()
         self.destroy()
 
-if __name__ == "__main__":
+def main():
     app = ChunapTool()
     app.mainloop()
+
+if __name__ == "__main__":
+    main()
