@@ -6,3 +6,5 @@ pyinstaller-hooks-contrib==2026.0
 pywin32-ctypes==0.2.3
 setuptools==80.10.2
 opencv-python==4.10.0.84
+Pillow==12.1.0
+mss==10.1.0

@@ -23,7 +23,8 @@ def get_base_dir() -> str:
             return os.path.dirname(sys.executable)
     except Exception:
         pass
-    return os.path.dirname(os.path.abspath(__file__))
+    # srcフォルダの1つ上（プロジェクトルート）を返す
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def resource_path(relative_path: str) -> str:
@@ -36,7 +37,7 @@ def resource_path(relative_path: str) -> str:
         # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
-        base_path = os.path.abspath(".")
+        base_path = get_base_dir()
 
     return os.path.join(base_path, relative_path)
 

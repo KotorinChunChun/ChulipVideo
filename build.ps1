@@ -9,4 +9,21 @@ python -m PyInstaller --noconsole --onefile --clean --noconfirm `
     --add-data "ChulipVideo.png;." `
     --icon="ChulipVideo.png" `
     --name="ChulipVideo" `
-    app.py
+    --paths="src" `
+    src/app.py
+
+# ビルド後のファイルコピー
+Write-Host "Copying additional files to dist..."
+$dist = "dist"
+
+# shortcutsフォルダ
+if (Test-Path "shortcuts") {
+    Copy-Item -Path "shortcuts" -Destination $dist -Recurse -Force
+}
+
+# batファイルすべて
+if (Test-Path "build_tools\*.bat") {
+    Copy-Item -Path "build_tools\*.bat" -Destination $dist -Force
+}
+
+Write-Host "Build and copy complete."

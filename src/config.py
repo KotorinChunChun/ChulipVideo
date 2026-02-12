@@ -57,12 +57,8 @@ DEFAULT_PRESETS = {
 
 def get_config_path() -> str:
     """設定ファイルのパスを返す. 実行ファイルと同じディレクトリ。"""
-    import sys
-    # utils.get_base_dir() と同等のロジックで実行ファイルディレクトリを取得
-    if getattr(sys, 'frozen', False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+    # utils.get_base_dir() はプロジェクトルート（またはexeの場所）を返す
+    base_dir = get_base_dir()
     return os.path.join(base_dir, CONFIG_FILENAME)
 
 

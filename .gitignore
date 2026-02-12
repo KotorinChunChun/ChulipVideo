@@ -23,6 +23,8 @@ Sample/
 
 # Memo
 memo.md
+PROMPT_LOG.md
+README_SNS.md
 
 # Virtual environments
 .venv/
@@ -55,3 +57,4 @@ build/
 
 # Keep config tracked: ChulipVideo_config.json should remain in repo unless you want it ignored
 ChulipVideo_config.json
+shortcuts.tsv
